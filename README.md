@@ -6,19 +6,23 @@ Built as a portfolio project demonstrating distributed systems fundamentals: lea
 
 ## Architecture
 
-```
-                     +-----------+
-                     | CLI Client|
-                     +-----+-----+
-                           | TCP
-              +------------+------------+
-              |            |            |
-         +----v----+  +----v----+  +----v----+
-         | Node 1  |  | Node 2  |  | Node 3  |
-         | (Leader)|  |(Follower)| |(Follower)|
-         +----+----+  +----+----+  +----+----+
-              |            |            |
-              +------Raft RPCs----------+
+```mermaid
+graph TD
+    client["CLI Client"]
+
+    client -->|TCP| n1
+    client -->|TCP| n2
+    client -->|TCP| n3
+
+    subgraph cluster["Raft Cluster"]
+        n1["Node 1\n(Leader)"]
+        n2["Node 2\n(Follower)"]
+        n3["Node 3\n(Follower)"]
+
+        n1 <-->|AppendEntries / Heartbeat| n2
+        n1 <-->|AppendEntries / Heartbeat| n3
+        n2 <-->|VoteRequest / VoteResponse| n3
+    end
 ```
 
 Each node runs three concurrent subsystems:
@@ -75,28 +79,19 @@ GET requests record `read_index = commit_index` and trigger a heartbeat round to
 
 ## Raft protocol coverage
 
-```mermaid
-graph LR
-    subgraph done["✅ Implemented"]
-        A[Leader election §5.2]
-        B[Log replication §5.3]
-        C[Commitment rule §5.4.2]
-        D[Log conflict resolution\nwith hints]
-        E[Noop entry on\nnew leader §8]
-        F[Crash recovery\npersistent state]
-        G[Read-index\nlinearizable reads]
-        H[Randomised\nelection timeouts]
-        I[Heartbeat suppression\nof elections]
-    end
-
-    subgraph future["❌ Future work"]
-        J[Log compaction\n/ snapshots]
-        K[Dynamic membership\nchanges]
-    end
-
-    style done fill:#1a3a1a,stroke:#2d6a2d,color:#90ee90
-    style future fill:#3a1a1a,stroke:#6a2d2d,color:#ffaaaa
-```
+| Feature | Status |
+|---|---|
+| Leader election (§5.2) | ✅ |
+| Log replication (§5.3) | ✅ |
+| Safety — commitment rule (§5.4.2) | ✅ |
+| Follower log conflict resolution with hints | ✅ |
+| Noop entry on new leader (§8) | ✅ |
+| Crash recovery via persistent state | ✅ |
+| Read-index linearizable reads | ✅ (core logic) |
+| Randomised election timeouts | ✅ |
+| Heartbeat suppression of elections | ✅ |
+| Log compaction / snapshots | ❌ (future work) |
+| Dynamic membership changes | ❌ (future work) |
 
 ## Current status
 
