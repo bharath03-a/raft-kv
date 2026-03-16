@@ -1,0 +1,11 @@
+[package]
+name = "raft-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bincode = "1"
+rand = "0.10.0"
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
+tracing = "0.1.44"

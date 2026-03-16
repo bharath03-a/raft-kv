@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "crates/raft-core",
+    "crates/raft-server",
+    "crates/raft-client",
+]
+resolver = "2"
