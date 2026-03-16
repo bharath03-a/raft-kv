@@ -44,11 +44,13 @@ struct PendingRead {
 /// core and handles all I/O side-effects returned via `Actions`.
 pub struct NodeActor {
     id: NodeId,
-    raft: RaftNode,
+    /// `Option` so we can `take()` for consuming transitions without
+    /// `mem::replace` and a dummy placeholder.
+    raft: Option<RaftNode>,
     kv: KvStore,
     transport_tx: mpsc::Sender<Outgoing>,
     transport_rx: mpsc::Receiver<Incoming>,
-    /// Client-facing request receiver.
+    /// Client-facing request receiver (fed by the transport's client handler).
     client_rx: mpsc::Receiver<(ClientRequest, oneshot::Sender<ClientResponse>)>,
     /// Pending write log_index → sender.
     pending_writes: HashMap<u64, PendingWrite>,
@@ -56,17 +58,20 @@ pub struct NodeActor {
     pending_reads: Vec<PendingRead>,
     state_path: PathBuf,
     config: RaftConfig,
-    election_timeout: Duration,
 }
 
 impl NodeActor {
+    /// Create and initialise a node actor.
+    ///
+    /// The channel pair for client requests is created internally: the sender
+    /// end is wired to the transport (which accepts client TCP connections on
+    /// the same port as peer traffic) and the receiver end is kept here.
     pub async fn new(
         id: NodeId,
         peers: HashMap<NodeId, SocketAddr>,
         listen_addr: SocketAddr,
         state_dir: PathBuf,
         config: RaftConfig,
-        client_rx: mpsc::Receiver<(ClientRequest, oneshot::Sender<ClientResponse>)>,
     ) -> Result<Self> {
         let state_path = state_dir.join(format!("node-{id}.state"));
 
@@ -75,16 +80,22 @@ impl NodeActor {
         info!(node_id = id, term = persistent.current_term, "recovered state");
 
         let peer_ids: Vec<NodeId> = peers.keys().copied().collect();
+        // cluster_size must reflect the actual cluster, not the hardcoded default.
+        let cluster_size = peer_ids.len() + 1;
+        let config = RaftConfig { cluster_size, ..config };
+
         let mut raft = RaftNode::new(id, peer_ids, config.clone());
         raft.persistent = persistent;
 
-        let transport = Transport::start(id, listen_addr, peers);
+        // Wire the client channel: transport writes to `client_tx`,
+        // this actor reads from `client_rx`.
+        let (client_tx, client_rx) = mpsc::channel(256);
 
-        let election_timeout = random_election_timeout(&config);
+        let transport = Transport::start(id, listen_addr, peers, client_tx);
 
         Ok(Self {
             id,
-            raft,
+            raft: Some(raft),
             kv: KvStore::new(),
             transport_tx: transport.outgoing_tx,
             transport_rx: transport.incoming_rx,
@@ -93,73 +104,82 @@ impl NodeActor {
             pending_reads: Vec::new(),
             state_path,
             config,
-            election_timeout,
         })
     }
 
     /// Run the node event loop indefinitely.
     pub async fn run(mut self) {
         let heartbeat_interval = Duration::from_millis(self.config.heartbeat_interval_ms);
-        let mut election_timer = time::interval(self.election_timeout);
-        election_timer.reset(); // don't fire immediately
+        let mut election_timer = Self::new_election_timer(&self.config);
         let mut heartbeat_timer = time::interval(heartbeat_interval);
 
         loop {
-            tokio::select! {
-                // Inbound network message.
+            let reset_election_timer = tokio::select! {
+                // Inbound peer message.
                 Some(incoming) = self.transport_rx.recv() => {
-                    self.handle_incoming(incoming).await;
+                    self.handle_incoming(incoming).await
                 }
-                // Client request submitted via the in-process channel.
+                // Client request submitted via the TCP client handler.
                 Some((req, reply)) = self.client_rx.recv() => {
                     self.handle_client(req, reply).await;
+                    false
                 }
                 // Election timeout fired.
                 _ = election_timer.tick() => {
+                    debug!(node_id = self.id, "election timeout");
                     self.handle_election_timeout().await;
-                    // Reset with new random timeout to prevent split votes.
-                    self.election_timeout = random_election_timeout(&self.config);
-                    election_timer = time::interval(self.election_timeout);
-                    election_timer.reset();
+                    true // always reset after timeout fires
                 }
                 // Heartbeat tick (leader only — ignored by followers/candidates).
                 _ = heartbeat_timer.tick() => {
                     self.handle_heartbeat().await;
+                    false
                 }
+            };
+
+            if reset_election_timer {
+                election_timer = Self::new_election_timer(&self.config);
             }
         }
     }
 
+    // ── Private helpers ────────────────────────────────────────────────────
+
+    fn raft(&self) -> &RaftNode {
+        self.raft.as_ref().expect("raft node must be set")
+    }
+
+    fn take_raft(&mut self) -> RaftNode {
+        self.raft.take().expect("raft node must be set")
+    }
+
+    fn new_election_timer(config: &RaftConfig) -> time::Interval {
+        use rand::RngExt;
+        let ms = rand::rng()
+            .random_range(config.election_timeout_min_ms..=config.election_timeout_max_ms);
+        let start = time::Instant::now() + Duration::from_millis(ms);
+        time::interval_at(start, Duration::from_millis(ms))
+    }
+
     // ── Inbound message dispatch ───────────────────────────────────────────
 
-    async fn handle_incoming(&mut self, incoming: Incoming) {
+    async fn handle_incoming(&mut self, incoming: Incoming) -> bool {
+        let raft = self.take_raft();
         let (new_raft, actions) = match incoming.message {
-            RaftMessage::VoteRequest(req) => {
-                let raft = std::mem::replace(&mut self.raft, unsafe_placeholder());
-                raft.handle_vote_request(req)
-            }
-            RaftMessage::VoteResponse(resp) => {
-                let raft = std::mem::replace(&mut self.raft, unsafe_placeholder());
-                raft.handle_vote_response(incoming.from, resp)
-            }
-            RaftMessage::AppendEntriesRequest(req) => {
-                let raft = std::mem::replace(&mut self.raft, unsafe_placeholder());
-                raft.handle_append_entries(req)
-            }
+            RaftMessage::VoteRequest(req) => raft.handle_vote_request(req),
+            RaftMessage::VoteResponse(resp) => raft.handle_vote_response(incoming.from, resp),
+            RaftMessage::AppendEntriesRequest(req) => raft.handle_append_entries(req),
             RaftMessage::AppendEntriesResponse(resp) => {
-                let raft = std::mem::replace(&mut self.raft, unsafe_placeholder());
                 raft.handle_append_entries_response(incoming.from, resp)
             }
-            RaftMessage::ClientRequest(req) => {
-                // Peer-forwarded client request — rare but valid.
-                let raft = std::mem::replace(&mut self.raft, unsafe_placeholder());
-                raft.handle_client_request(req)
+            RaftMessage::ClientRequest(req) => raft.handle_client_request(req),
+            RaftMessage::ClientResponse(_) => {
+                self.raft = Some(raft);
+                return false; // unexpected on server side
             }
-            RaftMessage::ClientResponse(_) => return, // unexpected
         };
-
-        self.raft = new_raft;
-        self.apply_actions(actions).await;
+        self.raft = Some(new_raft);
+        self.apply_actions(actions).await
     }
 
     async fn handle_client(
@@ -167,11 +187,11 @@ impl NodeActor {
         req: ClientRequest,
         reply: oneshot::Sender<ClientResponse>,
     ) {
-        if !self.raft.is_leader() {
+        if !self.raft().is_leader() {
             let response = ClientResponse {
                 id: req.id,
                 result: ClientResult::NotLeader {
-                    leader_hint: self.raft.current_leader,
+                    leader_hint: self.raft().current_leader,
                 },
             };
             let _ = reply.send(response);
@@ -181,71 +201,67 @@ impl NodeActor {
         match &req.operation {
             ClientOperation::Get { key } => {
                 // Read-index protocol: record read_index = current commit_index,
-                // send heartbeat round to confirm leadership, then serve once
-                // last_applied >= read_index.
-                let read_index = self.raft.volatile.commit_index;
+                // trigger a heartbeat to confirm we are still the leader, then
+                // serve the read once last_applied >= read_index.
+                let read_index = self.raft().volatile.commit_index;
                 self.pending_reads.push(PendingRead {
                     key: key.clone(),
                     request_id: req.id,
                     read_index,
                     reply,
                 });
-                // Trigger a heartbeat to confirm we are still leader.
-                let raft = std::mem::replace(&mut self.raft, unsafe_placeholder());
+                let raft = self.take_raft();
                 let (new_raft, actions) = raft.tick();
-                self.raft = new_raft;
+                self.raft = Some(new_raft);
                 self.apply_actions(actions).await;
             }
             ClientOperation::Put { .. } | ClientOperation::Delete { .. } => {
-                // Record pending write before calling into the core so we can
+                // Record the pending write before entering the core so we can
                 // associate the log index with the reply channel.
-                let next_index = self.raft.log().last_index() + 1;
+                let next_index = self.raft().log().last_index() + 1;
                 self.pending_writes.insert(
                     next_index,
-                    PendingWrite {
-                        request_id: req.id,
-                        reply,
-                    },
+                    PendingWrite { request_id: req.id, reply },
                 );
-                let raft = std::mem::replace(&mut self.raft, unsafe_placeholder());
+                let raft = self.take_raft();
                 let (new_raft, actions) = raft.handle_client_request(req);
-                self.raft = new_raft;
+                self.raft = Some(new_raft);
                 self.apply_actions(actions).await;
             }
         }
     }
 
     async fn handle_election_timeout(&mut self) {
-        debug!(node_id = self.id, "election timeout");
-        let raft = std::mem::replace(&mut self.raft, unsafe_placeholder());
+        let raft = self.take_raft();
         let (new_raft, actions) = raft.election_timeout();
-        self.raft = new_raft;
+        self.raft = Some(new_raft);
         self.apply_actions(actions).await;
     }
 
     async fn handle_heartbeat(&mut self) {
-        if !self.raft.is_leader() {
+        if !self.raft().is_leader() {
             return;
         }
-        let raft = std::mem::replace(&mut self.raft, unsafe_placeholder());
+        let raft = self.take_raft();
         let (new_raft, actions) = raft.tick();
-        self.raft = new_raft;
+        self.raft = Some(new_raft);
         self.apply_actions(actions).await;
     }
 
     // ── Action executor ────────────────────────────────────────────────────
 
-    async fn apply_actions(&mut self, actions: raft_core::Actions) {
+    /// Execute all side-effects in `actions` and return whether the election
+    /// timer should be reset.
+    async fn apply_actions(&mut self, actions: raft_core::Actions) -> bool {
         // 1. Persist durable state BEFORE sending any messages (Raft §5.4.1).
         if let Some(ref state) = actions.persist {
             if let Err(e) = storage::save(&self.state_path, state).await {
                 error!("failed to persist state: {e}");
-                // In a production system we would halt here to avoid violating
-                // durability guarantees. For this portfolio project we log and continue.
+                // In production we would halt here to avoid violating durability.
             }
         }
 
-        // 2. Send outbound messages.
+        // 2. Send outbound peer messages.
         for (to, msg) in actions.messages {
             let _ = self
                 .transport_tx
@@ -255,35 +271,31 @@ impl NodeActor {
 
         // 3. Apply committed entries to the KV state machine.
         for entry in &actions.entries_to_apply {
-            let (new_kv, _result) = self.kv.apply(&entry.command);
+            let (new_kv, result) = self.kv.apply(&entry.command);
             self.kv = new_kv;
-            self.raft.volatile.last_applied = entry.index;
+            if let Some(raft) = self.raft.as_mut() {
+                raft.volatile.last_applied = entry.index;
+            }
 
-            // Resolve any pending write for this log index.
+            // Resolve pending write for this log index (using actual KV result).
             if let Some(pending) = self.pending_writes.remove(&entry.index) {
                 let response = ClientResponse {
                     id: pending.request_id,
-                    result: ClientResult::Ok(None),
+                    result: ClientResult::Ok(result),
                 };
                 let _ = pending.reply.send(response);
             }
         }
 
-        // 4. Reset election timer if instructed.
-        // (The timer is managed in `run()`; we set a flag via the bool.)
-        // We can't reset timers from here directly, so we use the reset_election_timer
-        // flag in Actions. The run() loop reads it after each select! arm via
-        // a shared atomic or by checking raft state — here we take the simpler
-        // approach of relying on the caller to reset.
-
-        // 5. Serve pending reads if last_applied caught up to their read_index.
+        // 4. Serve pending reads if last_applied has caught up to read_index.
         self.drain_pending_reads();
+
+        actions.reset_election_timer
     }
 
     fn drain_pending_reads(&mut self) {
-        let last_applied = self.raft.volatile.last_applied;
+        let last_applied = self.raft().volatile.last_applied;
 
-        // Partition into (ready, still_waiting) by taking ownership.
         let (ready, waiting): (Vec<PendingRead>, Vec<PendingRead>) = self
             .pending_reads
             .drain(..)
@@ -302,24 +314,9 @@ impl NodeActor {
     }
 }
 
-fn random_election_timeout(config: &RaftConfig) -> Duration {
-    use rand::RngExt;
-    let ms = rand::rng()
-        .random_range(config.election_timeout_min_ms..=config.election_timeout_max_ms);
-    Duration::from_millis(ms)
-}
+// ── In-process client handle (used for testing) ────────────────────────────
 
-/// Create a temporary placeholder `RaftNode` so we can move out of `self.raft`
-/// during a state transition.
-///
-/// Safety: the placeholder is immediately replaced; it is never observed.
-fn unsafe_placeholder() -> RaftNode {
-    RaftNode::new(0, vec![], RaftConfig::default_local())
-}
-
-// ── Client-facing server ───────────────────────────────────────────────────
-
-/// A handle for submitting client requests to the node actor.
+/// A handle for submitting client requests to the node actor in-process.
 #[derive(Clone)]
 pub struct NodeHandle {
     tx: mpsc::Sender<(ClientRequest, oneshot::Sender<ClientResponse>)>,

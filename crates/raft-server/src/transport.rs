@@ -1,10 +1,10 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use futures::SinkExt;
-use raft_core::message::{NodeId, RaftMessage};
+use raft_core::message::{ClientRequest, ClientResponse, NodeId, RaftMessage};
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     time,
 };
 use tokio_util::codec::Framed;
@@ -28,13 +28,16 @@ pub struct Outgoing {
 
 /// Manages all TCP connections for a single Raft node.
 ///
-/// Accepts inbound connections from peers and clients on `listen_addr`.
-/// Maintains persistent outbound connections to each peer with
-/// automatic reconnection.
+/// A single listen address handles both peer-to-peer Raft traffic and
+/// client requests. The first message on a connection determines its type:
+/// - `VoteRequest` / `AppendEntriesRequest` → peer connection (forwarded to
+///   the `Incoming` channel with the sender's `NodeId`)
+/// - `ClientRequest` → client connection (read/write loop using the
+///   `client_tx` channel with an oneshot reply)
 pub struct Transport {
-    /// Channel the node reads from for all inbound messages.
+    /// Channel the node reads from for all inbound peer messages.
     pub incoming_rx: mpsc::Receiver<Incoming>,
-    /// Channel the node writes to for outbound messages.
+    /// Channel the node writes to for outbound peer messages.
     pub outgoing_tx: mpsc::Sender<Outgoing>,
 }
 
@@ -44,6 +47,7 @@ impl Transport {
         node_id: NodeId,
         listen_addr: SocketAddr,
         peers: HashMap<NodeId, SocketAddr>,
+        client_tx: mpsc::Sender<(ClientRequest, oneshot::Sender<ClientResponse>)>,
     ) -> Self {
         let (incoming_tx, incoming_rx) = mpsc::channel::<Incoming>(1024);
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<Outgoing>(1024);
@@ -53,7 +57,7 @@ impl Transport {
         // Spawn acceptor task.
         {
             let incoming_tx = incoming_tx.clone();
-            tokio::spawn(accept_loop(node_id, listen_addr, incoming_tx));
+            tokio::spawn(accept_loop(node_id, listen_addr, incoming_tx, client_tx));
         }
 
         // Spawn sender task.
@@ -71,6 +75,7 @@ async fn accept_loop(
     _node_id: NodeId,
     addr: SocketAddr,
     incoming_tx: mpsc::Sender<Incoming>,
+    client_tx: mpsc::Sender<(ClientRequest, oneshot::Sender<ClientResponse>)>,
 ) {
     let listener = loop {
         match TcpListener::bind(addr).await {
@@ -87,8 +92,11 @@ async fn accept_loop(
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
                 info!("accepted connection from {peer_addr}");
-                let tx = incoming_tx.clone();
-                tokio::spawn(read_connection(stream, tx));
+                tokio::spawn(read_connection(
+                    stream,
+                    incoming_tx.clone(),
+                    client_tx.clone(),
+                ));
             }
             Err(e) => {
                 error!("accept error: {e}");
@@ -97,18 +105,22 @@ async fn accept_loop(
     }
 }
 
-/// Reads messages from a single TCP connection and forwards them to the
-/// incoming channel. The `from` NodeId is encoded in the first message.
-async fn read_connection(stream: TcpStream, tx: mpsc::Sender<Incoming>) {
+/// Reads the first message to classify the connection, then either:
+/// - forwards all subsequent messages to `incoming_tx` (peer connection), or
+/// - drives a request/response loop via `client_tx` (client connection).
+async fn read_connection(
+    stream: TcpStream,
+    tx: mpsc::Sender<Incoming>,
+    client_tx: mpsc::Sender<(ClientRequest, oneshot::Sender<ClientResponse>)>,
+) {
     use futures::StreamExt;
 
     let peer_addr = stream.peer_addr().ok();
     let mut framed = Framed::new(stream, RaftCodec);
 
-    // The first message must identify the sender's NodeId.
+    // The first message determines whether this is a peer or a client.
     let from = match framed.next().await {
         Some(Ok(RaftMessage::VoteRequest(r))) => {
-            // Re-inject so the node processes it.
             let _ = tx
                 .send(Incoming {
                     from: r.candidate_id,
@@ -127,10 +139,14 @@ async fn read_connection(stream: TcpStream, tx: mpsc::Sender<Incoming>) {
                 .await;
             leader_id
         }
+        Some(Ok(RaftMessage::ClientRequest(req))) => {
+            // Client connection — switch to bidirectional request/response mode.
+            handle_client_conn(framed, req, client_tx).await;
+            return;
+        }
         Some(Ok(msg)) => {
-            // Client connection — use a sentinel NodeId of 0.
-            let _ = tx.send(Incoming { from: 0, message: msg }).await;
-            0
+            warn!("unexpected first message from {:?}: {:?}", peer_addr, msg);
+            return;
         }
         Some(Err(e)) => {
             warn!("decode error on {:?}: {e}", peer_addr);
@@ -139,7 +155,7 @@ async fn read_connection(stream: TcpStream, tx: mpsc::Sender<Incoming>) {
         None => return,
     };
 
-    // Continue reading subsequent messages from the same peer.
+    // Peer connection: continue reading subsequent messages.
     while let Some(result) = framed.next().await {
         match result {
             Ok(msg) => {
@@ -153,7 +169,50 @@ async fn read_connection(stream: TcpStream, tx: mpsc::Sender<Incoming>) {
             }
         }
     }
-    info!("connection from {from} closed");
+    info!("peer connection from {from} closed");
+}
+
+/// Drives a client TCP connection: reads `ClientRequest` messages, submits
+/// each one to the node via `client_tx`, and writes the `ClientResponse`
+/// back to the same TCP connection.
+async fn handle_client_conn(
+    mut framed: Framed<TcpStream, RaftCodec>,
+    first_req: ClientRequest,
+    client_tx: mpsc::Sender<(ClientRequest, oneshot::Sender<ClientResponse>)>,
+) {
+    use futures::StreamExt;
+
+    let mut next_req: Option<ClientRequest> = Some(first_req);
+
+    loop {
+        // Pick up either the pre-read first request or read the next one.
+        let req = match next_req.take() {
+            Some(r) => r,
+            None => match framed.next().await {
+                Some(Ok(RaftMessage::ClientRequest(r))) => r,
+                Some(Ok(_)) => break, // unexpected message type
+                Some(Err(e)) => {
+                    warn!("client decode error: {e}");
+                    break;
+                }
+                None => break, // client disconnected
+            },
+        };
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if client_tx.send((req, reply_tx)).await.is_err() {
+            break; // node shut down
+        }
+
+        match reply_rx.await {
+            Ok(resp) => {
+                if framed.send(RaftMessage::ClientResponse(resp)).await.is_err() {
+                    break; // client disconnected mid-response
+                }
+            }
+            Err(_) => break, // node dropped reply channel
+        }
+    }
 }
 
 /// Sends outbound messages, maintaining one long-lived TCP connection per peer

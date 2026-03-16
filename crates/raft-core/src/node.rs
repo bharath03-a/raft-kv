@@ -76,7 +76,20 @@ impl RaftNode {
             log: self.persistent.log.clone(),
         };
 
-        let vote_requests: Vec<(NodeId, RaftMessage)> = self
+        let candidate = Self {
+            role: Role::Candidate,
+            persistent: persistent.clone(),
+            current_leader: None,
+            ..self
+        };
+
+        // Single-node fast path: no peers → already have majority (just self).
+        if candidate.peers.is_empty() {
+            let leader_state = LeaderState::new(&[], last_log_index);
+            return candidate.become_leader(leader_state);
+        }
+
+        let vote_requests: Vec<(NodeId, RaftMessage)> = candidate
             .peers
             .iter()
             .map(|&peer| {
@@ -84,20 +97,13 @@ impl RaftNode {
                     peer,
                     RaftMessage::VoteRequest(VoteRequest {
                         term: new_term,
-                        candidate_id: self.id,
+                        candidate_id: candidate.id,
                         last_log_index,
                         last_log_term,
                     }),
                 )
             })
             .collect();
-
-        let node = Self {
-            role: Role::Candidate,
-            persistent: persistent.clone(),
-            current_leader: None,
-            ..self
-        };
 
         let actions = Actions {
             messages: vote_requests,
@@ -106,7 +112,7 @@ impl RaftNode {
             ..Actions::default()
         };
 
-        (node, actions)
+        (candidate, actions)
     }
 
     /// Handle an incoming RequestVote RPC.
@@ -222,6 +228,17 @@ impl RaftNode {
         }
 
         let messages = self.build_append_entries_for_all_peers();
+
+        // Single-node: no peers will ever respond, so advance commit on every tick.
+        if self.peers.is_empty() {
+            let (node, commit) = self.try_advance_commit();
+            return (node, Actions {
+                messages,
+                entries_to_apply: commit.entries_to_apply,
+                ..Actions::default()
+            });
+        }
+
         (self, Actions { messages, ..Actions::default() })
     }
 
@@ -592,19 +609,21 @@ impl RaftNode {
         // is sent by the server layer once the entry commits (tracked via
         // leader_state.pending keyed by log index).
         let messages = self.build_append_entries_for_all_peers();
-
-        let actions = Actions {
-            messages,
-            persist: Some(persistent),
-            ..Actions::default()
-        };
-
-        // Store pending response channel — the server layer inserts the
-        // oneshot::Sender via register_pending_write() before calling us.
-        // We tag the req_id on a synthesised response so the server can match.
+        let persist = Some(persistent);
         let _ = req_id; // server layer owns the channel mapping
 
-        (self, actions)
+        // Single-node: no peers will ever ack, so commit the entry immediately.
+        if self.peers.is_empty() {
+            let (node, commit) = self.try_advance_commit();
+            return (node, Actions {
+                messages,
+                persist,
+                entries_to_apply: commit.entries_to_apply,
+                ..Actions::default()
+            });
+        }
+
+        (self, Actions { messages, persist, ..Actions::default() })
     }
 
     /// Step down to follower when a higher term is observed (§5.1).
@@ -657,15 +676,12 @@ mod tests {
     #[test]
     fn single_node_election_becomes_leader_immediately() {
         let node = single_node();
-        let (candidate, _) = node.election_timeout();
-        assert_eq!(candidate.role, Role::Candidate);
-        assert_eq!(candidate.current_term(), 1);
-
-        // With no peers, majority = 1 (itself).
-        // Winning requires handling vote responses — but a single-node
-        // cluster has no peers, so the vote loop never fires in practice.
-        // The server layer handles this by treating a Candidate with no peers
-        // as immediately having won. Here we just verify the candidate state.
+        let (leader, actions) = node.election_timeout();
+        // Single-node clusters skip the vote round and become leader directly.
+        assert_eq!(leader.role, Role::Leader);
+        assert_eq!(leader.current_term(), 1);
+        // Must persist the Noop entry appended on election.
+        assert!(actions.persist.is_some());
     }
 
     #[test]

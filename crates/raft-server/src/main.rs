@@ -1,16 +1,9 @@
-mod codec;
-mod error;
-mod kv;
-mod node;
-mod storage;
-mod transport;
-
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use raft_core::{message::NodeId, RaftConfig};
-use tokio::sync::mpsc;
+use raft_server::node::NodeActor;
 use tracing::info;
 
 /// Raft KV — a distributed key-value store node.
@@ -21,14 +14,16 @@ struct Args {
     #[arg(long)]
     id: NodeId,
 
-    /// Address this node listens on (e.g. 127.0.0.1:7001).
+    /// Address this node listens on for both peer and client connections.
+    ///
+    /// Example: `--addr 127.0.0.1:7001`
     #[arg(long)]
     addr: SocketAddr,
 
     /// Comma-separated list of `id=addr` pairs for all **other** nodes.
     ///
     /// Example: `--peers 2=127.0.0.1:7002,3=127.0.0.1:7003`
-    #[arg(long)]
+    #[arg(long, default_value = "")]
     peers: String,
 
     /// Directory to store durable state.
@@ -68,24 +63,16 @@ async fn main() -> Result<()> {
 
     let config = RaftConfig::default_local();
 
-    let (client_tx, client_rx) = mpsc::channel(256);
-
-    let actor = node::NodeActor::new(
+    let actor = NodeActor::new(
         args.id,
         peers,
         args.addr,
         args.data_dir,
         config,
-        client_rx,
     )
     .await?;
 
     info!(id = args.id, addr = %args.addr, "starting node");
-
-    // In a production system we would also expose a TCP listener for direct
-    // client connections here and wire them to client_tx. For the portfolio
-    // project the client communicates via the existing transport layer.
-    let _ = client_tx; // keep alive
 
     actor.run().await;
 

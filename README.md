@@ -42,14 +42,17 @@ crates/
       state.rs       # Role, PersistentState, Actions command object
       node.rs        # RaftNode state machine (all transitions → Actions)
 
-  raft-server/   # Async TCP node binary
+  raft-server/   # Async TCP node (library + binary)
     src/
+      lib.rs         # Library face (used by integration tests)
       codec.rs       # Length-delimited bincode framing
-      transport.rs   # TCP acceptor + sender with reconnection
+      transport.rs   # TCP acceptor + sender; handles both peer and client conns
       kv.rs          # Immutable KvStore state machine
       storage.rs     # Crash-safe fsync persistence
-      node.rs        # tokio::select! event loop
-      main.rs        # CLI: --id, --addr, --peers
+      node.rs        # tokio::select! event loop (Option<RaftNode> ownership)
+      main.rs        # CLI: --id, --addr, --peers, --data-dir
+    tests/
+      e2e.rs         # Integration tests (in-process NodeActor, raw TCP client)
 
   raft-client/   # CLI client binary
     src/
@@ -95,21 +98,26 @@ GET requests record `read_index = commit_index` and trigger a heartbeat round to
 
 ## Current status
 
-The Raft core and KV state machine are complete and tested. The server and client compile to release binaries.
+The full stack is implemented and all tests pass. The server and client compile to release binaries and the cluster is end-to-end functional.
 
 **What works:**
 - Pure Raft state machine (election, replication, commitment)
+- Single-node clusters self-elect immediately (no-peers fast path)
 - Immutable KV state machine
 - Length-delimited bincode codec
-- Async TCP transport with reconnection
+- Async TCP transport — same port handles peer RPCs and client connections
 - Crash-safe fsync storage
 - CLI argument parsing for server and client
+- Client-facing TCP listener fully wired (no more dropped `client_tx`)
+- `Option<RaftNode>` ownership pattern (replaces `unsafe_placeholder`)
+- Election timer resets correctly on valid heartbeat receipt
+- KV state machine result returned to client on commit (not hardcoded `None`)
+- End-to-end integration tests: single-node, 3-node, concurrent writes, throughput
 
-**Known gaps (next milestone):**
-- Server does not yet expose a client-facing TCP listener — the `NodeHandle` exists but is not wired to an accept loop
-- Single-node clusters do not self-elect (no special case for zero peers)
-- No end-to-end integration test across multiple live nodes
-- `unsafe_placeholder()` in `node.rs` should be replaced with `Option<RaftNode>`
+**Known gaps (future work):**
+- Log compaction / snapshots (unbounded log growth on long-lived clusters)
+- Dynamic membership changes (cluster size is fixed at startup)
+- Leader failover test (currently tests 3 functional nodes; no kill-and-recover test)
 
 ## Tests
 
@@ -117,10 +125,17 @@ The Raft core and KV state machine are complete and tested. The server and clien
 cargo test --workspace
 ```
 
-23 tests, all passing:
+27 tests, all passing:
 - 7 log unit tests (append, truncate, query, immutability)
-- 10 Raft node unit tests (election, replication, step-down)
+- 10 Raft node unit tests (election, replication, step-down, single-node)
 - 6 KV state machine unit tests
+- 4 end-to-end integration tests (single-node, 3-node basic ops, 20 concurrent writes, throughput benchmark)
+
+**Throughput (debug build, 3-node cluster, sequential PUTs):** ~10 ops/s
+
+The bottleneck is the round-trip latency through the Raft consensus pipeline on
+loopback (propose → replicate to 2 nodes → commit → respond). A release build
+or async-batched proposals would improve this significantly.
 
 ## Usage (once wiring is complete)
 
