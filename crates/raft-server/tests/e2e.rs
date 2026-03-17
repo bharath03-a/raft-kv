@@ -9,6 +9,7 @@
 //!   - Raft leader election and log replication
 //!   - KV state machine application
 //!   - Leader-redirect following by the test client
+//!   - Leader failover: cluster survives the current leader being killed
 
 use std::{
     collections::HashMap,
@@ -18,17 +19,15 @@ use std::{
 };
 
 use futures::{SinkExt, StreamExt};
-use raft_core::message::{
-    ClientOperation, ClientRequest, ClientResult, NodeId, RaftMessage,
-};
+use raft_core::message::{ClientOperation, ClientRequest, ClientResult, NodeId, RaftMessage};
 use raft_core::RaftConfig;
 use raft_server::{codec::RaftCodec, node::NodeActor};
-use tokio::{net::TcpStream, time};
+use tempfile::TempDir;
+use tokio::{net::TcpStream, task::JoinHandle, time};
 use tokio_util::codec::Framed;
 
 // ── Port allocation ────────────────────────────────────────────────────────
 
-/// Starting port for test clusters. Each `alloc_port()` call increments by 1.
 static NEXT_PORT: AtomicU16 = AtomicU16::new(19_000);
 
 fn alloc_port() -> u16 {
@@ -39,17 +38,20 @@ fn alloc_port() -> u16 {
 
 struct Cluster {
     addrs: Vec<SocketAddr>,
-    // node_ids aligned with addrs
     node_ids: Vec<NodeId>,
+    /// Task handles — one per live node, aligned with `addrs`/`node_ids`.
+    handles: Vec<JoinHandle<()>>,
+    /// Keep alive so node data directories are not deleted mid-test.
+    _data_dir: TempDir,
 }
 
 impl Cluster {
-    /// Spin up `n` `NodeActor` instances as background tasks in the current
-    /// tokio runtime and wait for leader election to complete.
+    /// Spin up `n` `NodeActor` instances as background tasks and wait for
+    /// leader election to complete.
     async fn start(n: usize) -> Self {
         assert!(n >= 1);
 
-        let data_dir = tempfile::TempDir::new().expect("tmpdir");
+        let data_dir = TempDir::new().expect("tmpdir");
 
         let ports: Vec<u16> = (0..n).map(|_| alloc_port()).collect();
         let addrs: Vec<SocketAddr> = ports
@@ -58,9 +60,10 @@ impl Cluster {
             .collect();
         let node_ids: Vec<NodeId> = (1..=n as u64).collect();
 
-        // Build the complete id→addr map.
         let id_addr: HashMap<NodeId, SocketAddr> =
             node_ids.iter().copied().zip(addrs.iter().copied()).collect();
+
+        let mut handles = Vec::with_capacity(n);
 
         for &id in &node_ids {
             let peers: HashMap<NodeId, SocketAddr> = id_addr
@@ -79,26 +82,30 @@ impl Cluster {
             .await
             .expect("NodeActor::new");
 
-            // Leak the tempdir so it lives as long as the test.
-            // The OS cleans it up when the process exits.
-            let _ = std::mem::ManuallyDrop::new(tempfile::TempDir::new().unwrap());
-
-            tokio::spawn(actor.run());
+            handles.push(tokio::spawn(actor.run()));
         }
 
-        // Wait for election (election_timeout ∈ [150, 300] ms → allow 700 ms).
+        // Wait for election (timeout range 150–300 ms → allow 700 ms).
         time::sleep(Duration::from_millis(700)).await;
 
-        Self { addrs, node_ids }
+        Self { addrs, node_ids, handles, _data_dir: data_dir }
+    }
+
+    /// Abort the node at `index` (simulates a hard crash) and remove it from
+    /// the live node list so future `send()` calls skip it.
+    fn kill_node(&mut self, index: usize) {
+        self.handles[index].abort();
+        self.handles.remove(index);
+        self.addrs.remove(index);
+        self.node_ids.remove(index);
     }
 
     /// Send a single client operation, following leader redirects automatically.
-    /// Returns the `ClientResult` from the leader.
     async fn send(&self, op: ClientOperation) -> ClientResult {
         let mut req_id: u64 = 1;
         let mut addrs = self.addrs.clone();
 
-        for _ in 0..10 {
+        for _ in 0..40 {
             for &addr in &addrs {
                 let Ok(stream) = TcpStream::connect(addr).await else {
                     continue;
@@ -123,12 +130,9 @@ impl Cluster {
 
                 match resp.result {
                     ClientResult::NotLeader { leader_hint } => {
-                        // Reorder addrs to try the hinted leader first next iteration.
                         if let Some(hint_id) = leader_hint {
-                            if let Some(idx) = self
-                                .node_ids
-                                .iter()
-                                .position(|&nid| nid == hint_id)
+                            if let Some(idx) =
+                                self.node_ids.iter().position(|&nid| nid == hint_id)
                             {
                                 addrs = {
                                     let mut v = self.addrs.clone();
@@ -138,7 +142,7 @@ impl Cluster {
                             }
                         }
                         req_id += 1;
-                        break; // try again with the new order
+                        break;
                     }
                     result => return result,
                 }
@@ -151,10 +155,7 @@ impl Cluster {
 
     async fn put(&self, key: &str, value: &str) -> Option<String> {
         match self
-            .send(ClientOperation::Put {
-                key: key.into(),
-                value: value.into(),
-            })
+            .send(ClientOperation::Put { key: key.into(), value: value.into() })
             .await
         {
             ClientResult::Ok(prev) => prev,
@@ -180,13 +181,55 @@ impl Cluster {
     }
 }
 
+impl Drop for Cluster {
+    fn drop(&mut self) {
+        for h in &self.handles {
+            h.abort();
+        }
+    }
+}
+
+// ── Leader probe ───────────────────────────────────────────────────────────
+
+/// Connect to each node directly (no redirect) and return the index of the
+/// node that responds with `Ok` — i.e. the current leader.
+///
+/// Uses a GET probe: the leader applies the read-index protocol and responds
+/// with `Ok(None)` for an absent key; followers respond with `NotLeader`.
+async fn find_leader_index(addrs: &[SocketAddr]) -> usize {
+    for _ in 0..30 {
+        for (idx, &addr) in addrs.iter().enumerate() {
+            let Ok(stream) = TcpStream::connect(addr).await else {
+                continue;
+            };
+            let mut framed = Framed::new(stream, RaftCodec);
+            let _ = framed
+                .send(RaftMessage::ClientRequest(ClientRequest {
+                    id: 0,
+                    operation: ClientOperation::Get {
+                        key: "__probe__".into(),
+                    },
+                }))
+                .await;
+            let resp = time::timeout(Duration::from_millis(600), framed.next()).await;
+            if let Ok(Some(Ok(RaftMessage::ClientResponse(r)))) = resp {
+                if matches!(r.result, ClientResult::Ok(_)) {
+                    return idx;
+                }
+            }
+        }
+        time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("could not identify a leader");
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn single_node_put_get_delete() {
     let c = Cluster::start(1).await;
 
-    assert_eq!(c.put("x", "hello").await, None, "first PUT returns no prev");
+    assert_eq!(c.put("x", "hello").await, None, "first PUT: no previous value");
     assert_eq!(c.get("x").await, Some("hello".into()));
     assert_eq!(c.put("x", "world").await, Some("hello".into()), "overwrite returns prev");
     assert_eq!(c.get("x").await, Some("world".into()));
@@ -198,17 +241,14 @@ async fn single_node_put_get_delete() {
 async fn three_node_cluster_basic_ops() {
     let c = Cluster::start(3).await;
 
-    // Write multiple keys.
     c.put("a", "1").await;
     c.put("b", "2").await;
     c.put("c", "3").await;
 
-    // Read them back.
     assert_eq!(c.get("a").await, Some("1".into()));
     assert_eq!(c.get("b").await, Some("2".into()));
     assert_eq!(c.get("c").await, Some("3".into()));
 
-    // Delete one; others untouched.
     assert_eq!(c.delete("b").await, Some("2".into()));
     assert_eq!(c.get("b").await, None);
     assert_eq!(c.get("a").await, Some("1".into()));
@@ -219,7 +259,6 @@ async fn three_node_cluster_basic_ops() {
 async fn three_node_cluster_concurrent_writes() {
     let c = Cluster::start(3).await;
 
-    // Fire multiple writes concurrently.
     let puts: Vec<_> = (0u64..20)
         .map(|i| {
             let c = &c;
@@ -229,7 +268,6 @@ async fn three_node_cluster_concurrent_writes() {
 
     futures::future::join_all(puts).await;
 
-    // All keys should be readable.
     for i in 0u64..20 {
         assert_eq!(
             c.get(&format!("k{i}")).await,
@@ -239,7 +277,41 @@ async fn three_node_cluster_concurrent_writes() {
     }
 }
 
-/// Throughput: sequential PUTs; prints ops/s — not a pass/fail assertion.
+/// Kill the elected leader mid-operation and verify the remaining two nodes
+/// elect a new leader and continue serving reads and writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_node_leader_failover() {
+    let mut c = Cluster::start(3).await;
+
+    // Write some data to the healthy cluster.
+    c.put("before", "failover").await;
+    assert_eq!(c.get("before").await, Some("failover".into()));
+
+    // Find and kill the current leader.
+    let leader_idx = find_leader_index(&c.addrs).await;
+    c.kill_node(leader_idx);
+
+    // The remaining two nodes form a majority — allow more time under load
+    // (parallel test execution means election timeouts may take longer).
+    time::sleep(Duration::from_millis(1200)).await;
+
+    // Writes and reads must succeed on the two-node remainder.
+    c.put("after", "failover").await;
+
+    // Data written before the leader crash must still be readable.
+    assert_eq!(
+        c.get("before").await,
+        Some("failover".into()),
+        "pre-crash data must survive leader failover"
+    );
+    assert_eq!(
+        c.get("after").await,
+        Some("failover".into()),
+        "post-failover write must be readable"
+    );
+}
+
+/// Throughput: sequential PUTs; prints ops/s (not a pass/fail assertion).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn throughput_sequential_puts() {
     const N: u64 = 50;
@@ -252,14 +324,10 @@ async fn throughput_sequential_puts() {
     let elapsed = start.elapsed();
     let ops_per_sec = N as f64 / elapsed.as_secs_f64();
 
-    // Print throughput for the user to inspect (not a hard assertion).
     println!();
-    println!(
-        "Throughput: {N} sequential PUTs in {elapsed:.2?}  →  {ops_per_sec:.0} ops/s"
-    );
+    println!("Throughput: {N} sequential PUTs in {elapsed:.2?}  →  {ops_per_sec:.0} ops/s");
     println!();
 
-    // Sanity-check a few entries were actually committed.
     assert_eq!(c.get("bench-0").await, Some("0".into()));
     assert_eq!(c.get(&format!("bench-{}", N - 1)).await, Some((N - 1).to_string()));
 }
