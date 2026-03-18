@@ -119,25 +119,32 @@ async fn read_connection(
     let mut framed = Framed::new(stream, RaftCodec);
 
     // The first message determines whether this is a peer or a client.
+    // Request messages carry the sender's NodeId in their body; response
+    // messages carry it in the `peer_id` field added for exactly this purpose.
     let from = match framed.next().await {
         Some(Ok(RaftMessage::VoteRequest(r))) => {
-            let _ = tx
-                .send(Incoming {
-                    from: r.candidate_id,
-                    message: RaftMessage::VoteRequest(r.clone()),
-                })
-                .await;
-            r.candidate_id
+            let from = r.candidate_id;
+            let _ = tx.send(Incoming { from, message: RaftMessage::VoteRequest(r) }).await;
+            from
         }
         Some(Ok(RaftMessage::AppendEntriesRequest(r))) => {
-            let leader_id = r.leader_id;
+            let from = r.leader_id;
             let _ = tx
-                .send(Incoming {
-                    from: leader_id,
-                    message: RaftMessage::AppendEntriesRequest(r),
-                })
+                .send(Incoming { from, message: RaftMessage::AppendEntriesRequest(r) })
                 .await;
-            leader_id
+            from
+        }
+        Some(Ok(RaftMessage::VoteResponse(r))) => {
+            let from = r.peer_id;
+            let _ = tx.send(Incoming { from, message: RaftMessage::VoteResponse(r) }).await;
+            from
+        }
+        Some(Ok(RaftMessage::AppendEntriesResponse(r))) => {
+            let from = r.peer_id;
+            let _ = tx
+                .send(Incoming { from, message: RaftMessage::AppendEntriesResponse(r) })
+                .await;
+            from
         }
         Some(Ok(RaftMessage::ClientRequest(req))) => {
             // Client connection — switch to bidirectional request/response mode.

@@ -36,6 +36,10 @@ pub struct VoteRequest {
 pub struct VoteResponse {
     pub term: u64,
     pub vote_granted: bool,
+    /// The node that is sending this response.
+    /// Required so the receiver can identify the sender when this message
+    /// arrives as the first frame on a new TCP connection.
+    pub peer_id: NodeId,
 }
 
 /// AppendEntries RPC — also used as heartbeat when `entries` is empty (Raft §5.3).
@@ -58,6 +62,10 @@ pub struct AppendEntriesResponse {
     pub conflict_index: Option<u64>,
     /// On failure: the term of the conflicting entry (for term-based backtracking).
     pub conflict_term: Option<u64>,
+    /// The node that is sending this response.
+    /// Required so the receiver can identify the sender when this message
+    /// arrives as the first frame on a new TCP connection.
+    pub peer_id: NodeId,
 }
 
 // ── Client-facing protocol ─────────────────────────────────────────────────

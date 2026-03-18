@@ -140,6 +140,7 @@ impl RaftNode {
         let response = RaftMessage::VoteResponse(VoteResponse {
             term: node.persistent.current_term,
             vote_granted: grant,
+            peer_id: node.id,
         });
         actions.messages.push((req.candidate_id, response));
 
@@ -261,6 +262,7 @@ impl RaftNode {
                 success: false,
                 conflict_index: None,
                 conflict_term: None,
+                peer_id: node.id,
             });
             actions.messages.push((req.leader_id, resp));
             return (node, actions);
@@ -279,6 +281,7 @@ impl RaftNode {
                 success: false,
                 conflict_index: Some(conflict_index),
                 conflict_term,
+                peer_id: node.id,
             });
             actions.messages.push((req.leader_id, resp));
             return (node, actions);
@@ -320,6 +323,7 @@ impl RaftNode {
             success: true,
             conflict_index: None,
             conflict_term: None,
+            peer_id: node.id,
         });
 
         actions.messages.push((req.leader_id, resp));
