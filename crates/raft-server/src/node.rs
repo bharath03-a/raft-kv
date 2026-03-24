@@ -58,6 +58,8 @@ pub struct NodeActor {
     pending_reads: Vec<PendingRead>,
     state_path: PathBuf,
     config: RaftConfig,
+    /// When true, skip fsync on persist (faster but not crash-safe).
+    no_sync: bool,
 }
 
 impl NodeActor {
@@ -72,6 +74,7 @@ impl NodeActor {
         listen_addr: SocketAddr,
         state_dir: PathBuf,
         config: RaftConfig,
+        no_sync: bool,
     ) -> Result<Self> {
         let state_path = state_dir.join(format!("node-{id}.state"));
 
@@ -104,6 +107,7 @@ impl NodeActor {
             pending_reads: Vec::new(),
             state_path,
             config,
+            no_sync,
         })
     }
 
@@ -255,7 +259,7 @@ impl NodeActor {
     async fn apply_actions(&mut self, actions: raft_core::Actions) -> bool {
         // 1. Persist durable state BEFORE sending any messages (Raft §5.4.1).
         if let Some(ref state) = actions.persist {
-            if let Err(e) = storage::save(&self.state_path, state).await {
+            if let Err(e) = storage::save(&self.state_path, state, !self.no_sync).await {
                 error!("failed to persist state: {e}");
                 // In production we would halt here to avoid violating durability.
             }

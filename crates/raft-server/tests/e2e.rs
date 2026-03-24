@@ -78,6 +78,7 @@ impl Cluster {
                 id_addr[&id],
                 data_dir.path().join(format!("node-{id}")),
                 RaftConfig::default_local(),
+                true, // no_sync: tests don't need crash durability
             )
             .await
             .expect("NodeActor::new");

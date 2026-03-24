@@ -19,11 +19,12 @@ struct StoredState {
     log_entries: Vec<raft_core::message::LogEntry>,
 }
 
-/// Persist `state` to `path` with an fsync so it survives crashes (Raft §5.4.1).
+/// Persist `state` to `path`.
 ///
-/// We write to a `.tmp` file and rename atomically to avoid leaving a
-/// half-written file on crash.
-pub async fn save(path: &Path, state: &PersistentState) -> Result<()> {
+/// When `sync` is true we fsync before the rename — the Raft §5.4.1
+/// durability guarantee.  Pass `false` only for benchmarking; the
+/// cluster is not crash-safe in that mode.
+pub async fn save(path: &Path, state: &PersistentState, sync: bool) -> Result<()> {
     let stored = StoredState {
         current_term: state.current_term,
         voted_for: state.voted_for,
@@ -51,7 +52,9 @@ pub async fn save(path: &Path, state: &PersistentState) -> Result<()> {
         .context("write persistent state")?;
 
     file.flush().await.context("flush")?;
-    file.sync_all().await.context("fsync")?; // durability guarantee
+    if sync {
+        file.sync_all().await.context("fsync")?;
+    }
 
     fs::rename(&tmp_path, path)
         .await

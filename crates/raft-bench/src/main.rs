@@ -173,41 +173,50 @@ impl BenchClient {
         Ok(())
     }
 
-    /// Send one operation and return the round-trip duration.
+    /// Send one operation, following leader redirects automatically.
+    ///
+    /// Retries on the hinted leader up to 5 times before giving up.
+    /// Returns the total round-trip duration including any redirect latency.
     async fn send_once(&mut self, op: ClientOperation) -> Result<Duration> {
-        let framed = self.framed.as_mut().context("not connected")?;
-        let req_id = self.next_id;
-        self.next_id += 1;
-
         let t0 = Instant::now();
-        framed
-            .send(RaftMessage::ClientRequest(ClientRequest {
-                id: req_id,
-                operation: op.clone(),
-            }))
-            .await
-            .context("send")?;
 
-        let msg = time::timeout(Duration::from_secs(5), framed.next())
-            .await
-            .context("response timeout")?
-            .context("connection closed")?
-            .context("decode error")?;
+        for _ in 0..5 {
+            let req_id = self.next_id;
+            self.next_id += 1;
 
-        let elapsed = t0.elapsed();
+            let framed = self.framed.as_mut().context("not connected")?;
+            framed
+                .send(RaftMessage::ClientRequest(ClientRequest {
+                    id: req_id,
+                    operation: op.clone(),
+                }))
+                .await
+                .context("send")?;
 
-        if let RaftMessage::ClientResponse(resp) = msg {
-            match resp.result {
-                ClientResult::NotLeader { leader_hint } => {
-                    self.redirect(leader_hint).await?;
-                    return Err(anyhow::anyhow!("not leader — retrying"));
+            let msg = time::timeout(Duration::from_secs(5), framed.next())
+                .await
+                .context("response timeout")?
+                .context("connection closed")?
+                .context("decode error")?;
+
+            if let RaftMessage::ClientResponse(resp) = msg {
+                match resp.result {
+                    ClientResult::NotLeader { leader_hint } => {
+                        // Reconnect to the hinted leader and retry immediately
+                        // without returning to the caller — this prevents the
+                        // worker error handler from resetting to a non-leader.
+                        self.redirect(leader_hint).await?;
+                        continue;
+                    }
+                    ClientResult::Error(e) => bail!("server error: {e}"),
+                    ClientResult::Ok(_) => return Ok(t0.elapsed()),
                 }
-                ClientResult::Error(e) => bail!("server error: {e}"),
-                ClientResult::Ok(_) => return Ok(elapsed),
             }
+
+            bail!("unexpected response type");
         }
 
-        bail!("unexpected response type");
+        bail!("too many leader redirects");
     }
 
     async fn redirect(&mut self, hint: Option<NodeId>) -> Result<()> {

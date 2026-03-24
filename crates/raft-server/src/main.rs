@@ -29,6 +29,12 @@ struct Args {
     /// Directory to store durable state.
     #[arg(long, default_value = "data")]
     data_dir: PathBuf,
+
+    /// Skip fsync on each write (higher throughput, NOT crash-safe).
+    ///
+    /// Use only for benchmarking. Data may be lost on power failure.
+    #[arg(long, default_value_t = false)]
+    no_sync: bool,
 }
 
 #[tokio::main]
@@ -63,12 +69,17 @@ async fn main() -> Result<()> {
 
     let config = RaftConfig::default_local();
 
+    if args.no_sync {
+        tracing::warn!("--no-sync: fsync disabled — cluster is NOT crash-safe");
+    }
+
     let actor = NodeActor::new(
         args.id,
         peers,
         args.addr,
         args.data_dir,
         config,
+        args.no_sync,
     )
     .await?;
 
