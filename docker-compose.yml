@@ -1,0 +1,77 @@
+version: "3.9"
+
+# Three-node Raft KV cluster.
+#
+# Usage:
+#   docker compose up --build          # start cluster (builds image first)
+#   docker compose up -d               # start in background
+#   docker compose logs -f node1       # tail logs for node 1
+#   docker compose down -v             # stop and delete volumes
+#
+# Client connections:
+#   The cluster accepts client TCP on ports 7001/7002/7003 on the host.
+#   Any node can receive a request; non-leaders redirect to the current leader.
+#
+# Metrics:
+#   Prometheus metrics are served over HTTP on ports 9001/9002/9003.
+#   curl http://localhost:9001/metrics
+
+networks:
+  raft:
+    driver: bridge
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+
+x-node-base: &node-base
+  build: .
+  restart: unless-stopped
+  networks:
+    - raft
+  environment:
+    - RUST_LOG=raft_server=info
+
+services:
+  node1:
+    <<: *node-base
+    command:
+      - --id=1
+      - --addr=0.0.0.0:7001
+      - --peers=2=node2:7001,3=node3:7001
+      - --data-dir=/data
+      - --metrics-addr=0.0.0.0:9001
+    ports:
+      - "7001:7001"
+      - "9001:9001"
+    volumes:
+      - node1-data:/data
+
+  node2:
+    <<: *node-base
+    command:
+      - --id=2
+      - --addr=0.0.0.0:7001
+      - --peers=1=node1:7001,3=node3:7001
+      - --data-dir=/data
+      - --metrics-addr=0.0.0.0:9001
+    ports:
+      - "7002:7001"
+      - "9002:9001"
+    volumes:
+      - node2-data:/data
+
+  node3:
+    <<: *node-base
+    command:
+      - --id=3
+      - --addr=0.0.0.0:7001
+      - --peers=1=node1:7001,2=node2:7001
+      - --data-dir=/data
+      - --metrics-addr=0.0.0.0:9001
+    ports:
+      - "7003:7001"
+      - "9003:9001"
+    volumes:
+      - node3-data:/data

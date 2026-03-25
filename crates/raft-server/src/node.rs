@@ -19,7 +19,9 @@ use tokio::{
 use tracing::{debug, error, info};
 
 use crate::{
+    chaos::ChaosConfig,
     kv::KvStore,
+    metrics::Metrics,
     storage,
     transport::{Incoming, Outgoing, Transport},
 };
@@ -60,6 +62,8 @@ pub struct NodeActor {
     config: RaftConfig,
     /// When true, skip fsync on persist (faster but not crash-safe).
     no_sync: bool,
+    /// Shared metrics updated after every state transition.
+    metrics: std::sync::Arc<Metrics>,
 }
 
 impl NodeActor {
@@ -68,6 +72,7 @@ impl NodeActor {
     /// The channel pair for client requests is created internally: the sender
     /// end is wired to the transport (which accepts client TCP connections on
     /// the same port as peer traffic) and the receiver end is kept here.
+    /// Create and initialise a node actor with no chaos injection.
     pub async fn new(
         id: NodeId,
         peers: HashMap<NodeId, SocketAddr>,
@@ -75,6 +80,23 @@ impl NodeActor {
         state_dir: PathBuf,
         config: RaftConfig,
         no_sync: bool,
+    ) -> Result<Self> {
+        Self::new_with_chaos(id, peers, listen_addr, state_dir, config, no_sync, ChaosConfig::none()).await
+    }
+
+    /// Create a node actor with a custom chaos configuration.
+    ///
+    /// `ChaosConfig::none()` is the production default.  Pass
+    /// `ChaosConfig::twenty_percent()` or a custom config to inject message
+    /// drops for fault-tolerance testing.
+    pub async fn new_with_chaos(
+        id: NodeId,
+        peers: HashMap<NodeId, SocketAddr>,
+        listen_addr: SocketAddr,
+        state_dir: PathBuf,
+        config: RaftConfig,
+        no_sync: bool,
+        chaos: ChaosConfig,
     ) -> Result<Self> {
         let state_path = state_dir.join(format!("node-{id}.state"));
 
@@ -94,7 +116,7 @@ impl NodeActor {
         // this actor reads from `client_rx`.
         let (client_tx, client_rx) = mpsc::channel(256);
 
-        let transport = Transport::start(id, listen_addr, peers, client_tx);
+        let transport = Transport::start(id, listen_addr, peers, client_tx, chaos);
 
         Ok(Self {
             id,
@@ -108,7 +130,16 @@ impl NodeActor {
             state_path,
             config,
             no_sync,
+            metrics: Metrics::new(),
         })
+    }
+
+    /// Return a shared reference to the node's live metrics.
+    ///
+    /// Callers can pass this `Arc` to `metrics::serve` to expose the metrics
+    /// over HTTP without any additional synchronisation.
+    pub fn metrics(&self) -> std::sync::Arc<Metrics> {
+        std::sync::Arc::clone(&self.metrics)
     }
 
     /// Run the node event loop indefinitely.
@@ -168,6 +199,7 @@ impl NodeActor {
     // ── Inbound message dispatch ───────────────────────────────────────────
 
     async fn handle_incoming(&mut self, incoming: Incoming) -> bool {
+        self.metrics.messages_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let raft = self.take_raft();
         let (new_raft, actions) = match incoming.message {
             RaftMessage::VoteRequest(req) => raft.handle_vote_request(req),
@@ -266,11 +298,15 @@ impl NodeActor {
         }
 
         // 2. Send outbound peer messages.
+        let msg_count = actions.messages.len() as u64;
         for (to, msg) in actions.messages {
             let _ = self
                 .transport_tx
                 .send(Outgoing { to, message: msg })
                 .await;
+        }
+        if msg_count > 0 {
+            self.metrics.messages_sent.fetch_add(msg_count, std::sync::atomic::Ordering::Relaxed);
         }
 
         // 3. Apply committed entries to the KV state machine.
@@ -293,6 +329,24 @@ impl NodeActor {
 
         // 4. Serve pending reads if last_applied has caught up to read_index.
         self.drain_pending_reads();
+
+        // 5. Update live metrics after every state transition.
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let r = self.raft();
+            let role_u8 = match r.role {
+                raft_core::state::Role::Follower => 0,
+                raft_core::state::Role::Candidate => 1,
+                raft_core::state::Role::Leader => 2,
+            };
+            self.metrics.term.store(r.persistent.current_term, Relaxed);
+            self.metrics.role.store(role_u8, Relaxed);
+            self.metrics.commit_index.store(r.volatile.commit_index, Relaxed);
+            self.metrics.last_applied.store(r.volatile.last_applied, Relaxed);
+            self.metrics.log_length.store(r.log().len() as u64, Relaxed);
+            self.metrics.pending_writes.store(self.pending_writes.len() as u64, Relaxed);
+            self.metrics.pending_reads.store(self.pending_reads.len() as u64, Relaxed);
+        }
 
         actions.reset_election_timer
     }

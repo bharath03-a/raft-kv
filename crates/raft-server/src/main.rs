@@ -3,7 +3,7 @@ use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 use anyhow::{Context, Result};
 use clap::Parser;
 use raft_core::{message::NodeId, RaftConfig};
-use raft_server::node::NodeActor;
+use raft_server::{metrics, node::NodeActor};
 use tracing::info;
 
 /// Raft KV — a distributed key-value store node.
@@ -35,6 +35,13 @@ struct Args {
     /// Use only for benchmarking. Data may be lost on power failure.
     #[arg(long, default_value_t = false)]
     no_sync: bool,
+
+    /// Address to serve Prometheus metrics over HTTP.
+    ///
+    /// Example: `--metrics-addr 0.0.0.0:9001`
+    /// Metrics are served at any path (e.g. `curl http://127.0.0.1:9000/metrics`).
+    #[arg(long, default_value = "127.0.0.1:9000")]
+    metrics_addr: SocketAddr,
 }
 
 #[tokio::main]
@@ -83,7 +90,11 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    info!(id = args.id, addr = %args.addr, "starting node");
+    // Spawn the Prometheus metrics HTTP server as a background task.
+    let node_metrics = actor.metrics();
+    tokio::spawn(metrics::serve(args.metrics_addr, args.id, node_metrics));
+
+    info!(id = args.id, addr = %args.addr, metrics = %args.metrics_addr, "starting node");
 
     actor.run().await;
 

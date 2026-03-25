@@ -10,6 +10,7 @@ use tokio::{
 use tokio_util::codec::Framed;
 use tracing::{error, info, warn};
 
+use crate::chaos::ChaosConfig;
 use crate::codec::RaftCodec;
 
 /// An incoming message and who sent it.
@@ -48,6 +49,7 @@ impl Transport {
         listen_addr: SocketAddr,
         peers: HashMap<NodeId, SocketAddr>,
         client_tx: mpsc::Sender<(ClientRequest, oneshot::Sender<ClientResponse>)>,
+        chaos: ChaosConfig,
     ) -> Self {
         let (incoming_tx, incoming_rx) = mpsc::channel::<Incoming>(1024);
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<Outgoing>(1024);
@@ -57,11 +59,17 @@ impl Transport {
         // Spawn acceptor task.
         {
             let incoming_tx = incoming_tx.clone();
-            tokio::spawn(accept_loop(node_id, listen_addr, incoming_tx, client_tx));
+            tokio::spawn(accept_loop(
+                node_id,
+                listen_addr,
+                incoming_tx,
+                client_tx,
+                chaos.clone(),
+            ));
         }
 
         // Spawn sender task.
-        tokio::spawn(send_loop(outgoing_rx, Arc::clone(&peers)));
+        tokio::spawn(send_loop(outgoing_rx, Arc::clone(&peers), chaos));
 
         Self {
             incoming_rx,
@@ -76,6 +84,7 @@ async fn accept_loop(
     addr: SocketAddr,
     incoming_tx: mpsc::Sender<Incoming>,
     client_tx: mpsc::Sender<(ClientRequest, oneshot::Sender<ClientResponse>)>,
+    chaos: ChaosConfig,
 ) {
     let listener = loop {
         match TcpListener::bind(addr).await {
@@ -96,6 +105,7 @@ async fn accept_loop(
                     stream,
                     incoming_tx.clone(),
                     client_tx.clone(),
+                    chaos.clone(),
                 ));
             }
             Err(e) => {
@@ -112,11 +122,24 @@ async fn read_connection(
     stream: TcpStream,
     tx: mpsc::Sender<Incoming>,
     client_tx: mpsc::Sender<(ClientRequest, oneshot::Sender<ClientResponse>)>,
+    chaos: ChaosConfig,
 ) {
     use futures::StreamExt;
 
     let peer_addr = stream.peer_addr().ok();
     let mut framed = Framed::new(stream, RaftCodec);
+
+    // Helper: forward an inbound peer message, optionally dropping it for chaos.
+    macro_rules! maybe_forward {
+        ($from:expr, $msg:expr) => {{
+            if chaos.should_drop_inbound() {
+                tracing::debug!("chaos: dropped inbound {:?}", $msg);
+            } else {
+                let _ = tx.send(Incoming { from: $from, message: $msg }).await;
+            }
+            $from
+        }};
+    }
 
     // The first message determines whether this is a peer or a client.
     // Request messages carry the sender's NodeId in their body; response
@@ -124,30 +147,23 @@ async fn read_connection(
     let from = match framed.next().await {
         Some(Ok(RaftMessage::VoteRequest(r))) => {
             let from = r.candidate_id;
-            let _ = tx.send(Incoming { from, message: RaftMessage::VoteRequest(r) }).await;
-            from
+            maybe_forward!(from, RaftMessage::VoteRequest(r))
         }
         Some(Ok(RaftMessage::AppendEntriesRequest(r))) => {
             let from = r.leader_id;
-            let _ = tx
-                .send(Incoming { from, message: RaftMessage::AppendEntriesRequest(r) })
-                .await;
-            from
+            maybe_forward!(from, RaftMessage::AppendEntriesRequest(r))
         }
         Some(Ok(RaftMessage::VoteResponse(r))) => {
             let from = r.peer_id;
-            let _ = tx.send(Incoming { from, message: RaftMessage::VoteResponse(r) }).await;
-            from
+            maybe_forward!(from, RaftMessage::VoteResponse(r))
         }
         Some(Ok(RaftMessage::AppendEntriesResponse(r))) => {
             let from = r.peer_id;
-            let _ = tx
-                .send(Incoming { from, message: RaftMessage::AppendEntriesResponse(r) })
-                .await;
-            from
+            maybe_forward!(from, RaftMessage::AppendEntriesResponse(r))
         }
         Some(Ok(RaftMessage::ClientRequest(req))) => {
             // Client connection — switch to bidirectional request/response mode.
+            // Client messages are never subject to chaos injection.
             handle_client_conn(framed, req, client_tx).await;
             return;
         }
@@ -166,6 +182,10 @@ async fn read_connection(
     while let Some(result) = framed.next().await {
         match result {
             Ok(msg) => {
+                if chaos.should_drop_inbound() {
+                    tracing::debug!("chaos: dropped inbound {:?}", msg);
+                    continue;
+                }
                 if tx.send(Incoming { from, message: msg }).await.is_err() {
                     break; // node shut down
                 }
@@ -227,10 +247,19 @@ async fn handle_client_conn(
 async fn send_loop(
     mut rx: mpsc::Receiver<Outgoing>,
     peers: Arc<HashMap<NodeId, SocketAddr>>,
+    chaos: ChaosConfig,
 ) {
     let mut connections: HashMap<NodeId, Framed<TcpStream, RaftCodec>> = HashMap::new();
 
     while let Some(Outgoing { to, message }) = rx.recv().await {
+        // Chaos: drop outbound Raft peer messages at the configured rate.
+        // Client responses are never dropped (they travel on the client's
+        // connection, not through send_loop).
+        if chaos.should_drop_outbound() {
+            tracing::debug!("chaos: dropped outbound message to {to}");
+            continue;
+        }
+
         let addr = match peers.get(&to) {
             Some(a) => *a,
             None => {
