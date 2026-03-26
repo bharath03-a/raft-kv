@@ -24,6 +24,8 @@ volumes:
   node1-data:
   node2-data:
   node3-data:
+  prometheus-data:
+  grafana-data:
 
 x-node-base: &node-base
   build: .
@@ -75,3 +77,37 @@ services:
       - "9003:9001"
     volumes:
       - node3-data:/data
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    networks:
+      - raft
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=2h
+    depends_on:
+      - node1
+      - node2
+      - node3
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    networks:
+      - raft
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus

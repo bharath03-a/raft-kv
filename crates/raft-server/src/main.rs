@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
+use std::{collections::HashMap, net::{SocketAddr, ToSocketAddrs}, path::PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -65,7 +65,11 @@ async fn main() -> Result<()> {
                 .split_once('=')
                 .with_context(|| format!("invalid peer spec: {s}"))?;
             let id: NodeId = id_str.parse().context("peer id")?;
-            let addr: SocketAddr = addr_str.parse().context("peer addr")?;
+            let addr: SocketAddr = addr_str
+                .to_socket_addrs()
+                .with_context(|| format!("peer addr: {addr_str}"))?
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("no address resolved for {addr_str}"))?;
             Ok((id, addr))
         })
         .collect::<Result<_>>()?;

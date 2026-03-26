@@ -290,10 +290,10 @@ impl RaftNode {
         // Append new entries, truncating any conflicting tail (§5.3).
         let mut log = node.persistent.log.clone();
         for entry in &req.entries {
-            if let Some(existing) = log.get(entry.index)
-                && existing.term != entry.term
-            {
-                log = log.truncate_from(entry.index);
+            if let Some(existing) = log.get(entry.index) {
+                if existing.term != entry.term {
+                    log = log.truncate_from(entry.index);
+                }
             }
             if log.get(entry.index).is_none() {
                 log = log.append(entry.clone());

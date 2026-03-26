@@ -3,6 +3,7 @@ target/
 *.md
 img/
 docs/
+monitoring/
 bench.sh
 profile.sh
 data/

@@ -96,19 +96,19 @@ start_cluster() {
 
   $BINARY --id 1 --addr 127.0.0.1:7001 \
     --peers "2=127.0.0.1:7002,3=127.0.0.1:7003" \
-    --data-dir "$DATA_DIR/node1" $sync_flag \
+    --data-dir "$DATA_DIR/node1" --metrics-addr 127.0.0.1:9001 $sync_flag \
     > "$DATA_DIR/node1.log" 2>&1 &
   PIDS+=($!)
 
   $BINARY --id 2 --addr 127.0.0.1:7002 \
     --peers "1=127.0.0.1:7001,3=127.0.0.1:7003" \
-    --data-dir "$DATA_DIR/node2" $sync_flag \
+    --data-dir "$DATA_DIR/node2" --metrics-addr 127.0.0.1:9002 $sync_flag \
     > "$DATA_DIR/node2.log" 2>&1 &
   PIDS+=($!)
 
   $BINARY --id 3 --addr 127.0.0.1:7003 \
     --peers "1=127.0.0.1:7001,2=127.0.0.1:7002" \
-    --data-dir "$DATA_DIR/node3" $sync_flag \
+    --data-dir "$DATA_DIR/node3" --metrics-addr 127.0.0.1:9003 $sync_flag \
     > "$DATA_DIR/node3.log" 2>&1 &
   PIDS+=($!)
 
