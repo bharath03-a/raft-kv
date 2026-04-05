@@ -139,8 +139,7 @@ impl ChaosCluster {
                 match resp.result {
                     ClientResult::NotLeader { leader_hint } => {
                         if let Some(hint_id) = leader_hint
-                            && let Some(idx) =
-                                self.node_ids.iter().position(|&nid| nid == hint_id)
+                            && let Some(idx) = self.node_ids.iter().position(|&nid| nid == hint_id)
                         {
                             addrs = {
                                 let mut v = self.addrs.clone();
