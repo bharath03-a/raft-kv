@@ -61,15 +61,24 @@ mod tests {
     #[test]
     fn put_and_get() {
         let store = KvStore::new();
-        let (store, _) = store.apply(&Command::Put { key: "x".into(), value: "1".into() });
+        let (store, _) = store.apply(&Command::Put {
+            key: "x".into(),
+            value: "1".into(),
+        });
         assert_eq!(store.get("x"), Some("1"));
     }
 
     #[test]
     fn overwrite_returns_previous() {
         let store = KvStore::new();
-        let (store, _) = store.apply(&Command::Put { key: "x".into(), value: "1".into() });
-        let (store, prev) = store.apply(&Command::Put { key: "x".into(), value: "2".into() });
+        let (store, _) = store.apply(&Command::Put {
+            key: "x".into(),
+            value: "1".into(),
+        });
+        let (store, prev) = store.apply(&Command::Put {
+            key: "x".into(),
+            value: "2".into(),
+        });
         assert_eq!(prev, Some("1".into()));
         assert_eq!(store.get("x"), Some("2"));
     }
@@ -77,7 +86,10 @@ mod tests {
     #[test]
     fn delete_existing_key() {
         let store = KvStore::new();
-        let (store, _) = store.apply(&Command::Put { key: "x".into(), value: "1".into() });
+        let (store, _) = store.apply(&Command::Put {
+            key: "x".into(),
+            value: "1".into(),
+        });
         let (store, removed) = store.apply(&Command::Delete { key: "x".into() });
         assert_eq!(removed, Some("1".into()));
         assert!(store.get("x").is_none());
@@ -86,7 +98,9 @@ mod tests {
     #[test]
     fn delete_nonexistent_key_returns_none() {
         let store = KvStore::new();
-        let (store, removed) = store.apply(&Command::Delete { key: "missing".into() });
+        let (store, removed) = store.apply(&Command::Delete {
+            key: "missing".into(),
+        });
         assert!(removed.is_none());
         assert!(store.is_empty());
     }
@@ -94,7 +108,10 @@ mod tests {
     #[test]
     fn noop_is_identity() {
         let store = KvStore::new();
-        let (store, _) = store.apply(&Command::Put { key: "a".into(), value: "1".into() });
+        let (store, _) = store.apply(&Command::Put {
+            key: "a".into(),
+            value: "1".into(),
+        });
         let (after, result) = store.clone().apply(&Command::Noop);
         assert!(result.is_none());
         assert_eq!(after.get("a"), Some("1"));
@@ -103,7 +120,10 @@ mod tests {
     #[test]
     fn immutability_original_unchanged() {
         let store = KvStore::new();
-        let (store_with_key, _) = store.apply(&Command::Put { key: "k".into(), value: "v".into() });
+        let (store_with_key, _) = store.apply(&Command::Put {
+            key: "k".into(),
+            value: "v".into(),
+        });
         // Original store is untouched.
         assert!(store.get("k").is_none());
         assert_eq!(store_with_key.get("k"), Some("v"));

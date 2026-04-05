@@ -1,5 +1,9 @@
 # raft-kv
 
+[![CI](https://github.com/bharath03-a/raft-kv/actions/workflows/ci.yml/badge.svg)](https://github.com/bharath03-a/raft-kv/actions/workflows/ci.yml)
+[![Rust](https://img.shields.io/badge/rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A distributed key-value store built in Rust using the [Raft consensus protocol](https://raft.github.io/raft.pdf).
 
 Built as a portfolio project demonstrating distributed systems fundamentals: leader election, log replication, linearizable reads, and fault tolerance.

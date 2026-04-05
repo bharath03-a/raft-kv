@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, time::Duration};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use futures::{SinkExt, StreamExt};
 use raft_core::message::{
     ClientOperation, ClientRequest, ClientResponse, ClientResult, NodeId, RaftMessage,
@@ -42,9 +42,7 @@ impl ClusterConnection {
 
     /// Send a GET and return the value (or `None` if the key doesn't exist).
     pub async fn get(&mut self, key: impl Into<String>) -> Result<Option<String>> {
-        let resp = self
-            .send(ClientOperation::Get { key: key.into() })
-            .await?;
+        let resp = self.send(ClientOperation::Get { key: key.into() }).await?;
         match resp.result {
             ClientResult::Ok(value) => Ok(value),
             ClientResult::Error(e) => bail!("server error: {e}"),
@@ -92,7 +90,10 @@ impl ClusterConnection {
         self.next_request_id += 1;
 
         for attempt in 0..MAX_REDIRECTS {
-            let req = ClientRequest { id, operation: op.clone() };
+            let req = ClientRequest {
+                id,
+                operation: op.clone(),
+            };
             self.framed
                 .send(RaftMessage::ClientRequest(req))
                 .await
@@ -107,11 +108,7 @@ impl ClusterConnection {
             if let RaftMessage::ClientResponse(resp) = msg {
                 match &resp.result {
                     ClientResult::NotLeader { leader_hint } => {
-                        warn!(
-                            attempt,
-                            leader_hint,
-                            "not leader — redirecting"
-                        );
+                        warn!(attempt, leader_hint, "not leader — redirecting");
                         self.redirect(*leader_hint).await?;
                     }
                     _ => return Ok(resp),

@@ -28,14 +28,10 @@ pub async fn save(path: &Path, state: &PersistentState, sync: bool) -> Result<()
     let stored = StoredState {
         current_term: state.current_term,
         voted_for: state.voted_for,
-        log_entries: state
-            .log
-            .entries_after(0)
-            .to_vec(),
+        log_entries: state.log.entries_after(0).to_vec(),
     };
 
-    let payload =
-        bincode::serialize(&stored).context("failed to serialise persistent state")?;
+    let payload = bincode::serialize(&stored).context("failed to serialise persistent state")?;
 
     let tmp_path = path.with_extension("tmp");
 
@@ -79,8 +75,7 @@ pub async fn load(path: &Path) -> Result<PersistentState> {
         .await
         .context("read persistent state")?;
 
-    let stored: StoredState =
-        bincode::deserialize(&buf).context("deserialise persistent state")?;
+    let stored: StoredState = bincode::deserialize(&buf).context("deserialise persistent state")?;
 
     let mut log = raft_core::log::RaftLog::new();
     for entry in stored.log_entries {

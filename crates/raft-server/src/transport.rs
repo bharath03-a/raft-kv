@@ -135,7 +135,12 @@ async fn read_connection(
             if chaos.should_drop_inbound() {
                 tracing::debug!("chaos: dropped inbound {:?}", $msg);
             } else {
-                let _ = tx.send(Incoming { from: $from, message: $msg }).await;
+                let _ = tx
+                    .send(Incoming {
+                        from: $from,
+                        message: $msg,
+                    })
+                    .await;
             }
             $from
         }};
@@ -233,7 +238,11 @@ async fn handle_client_conn(
 
         match reply_rx.await {
             Ok(resp) => {
-                if framed.send(RaftMessage::ClientResponse(resp)).await.is_err() {
+                if framed
+                    .send(RaftMessage::ClientResponse(resp))
+                    .await
+                    .is_err()
+                {
                     break; // client disconnected mid-response
                 }
             }

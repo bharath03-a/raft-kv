@@ -21,13 +21,13 @@
 use std::{
     net::SocketAddr,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use futures::{SinkExt, StreamExt};
 use raft_core::message::{ClientOperation, ClientRequest, ClientResult, NodeId, RaftMessage};
@@ -53,7 +53,10 @@ mod codec {
             let payload = bincode::serialize(&msg)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             if payload.len() > MAX_FRAME {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "frame too large",
+                ));
             }
             dst.reserve(4 + payload.len());
             dst.put_u32(payload.len() as u32);
@@ -71,7 +74,10 @@ mod codec {
             }
             let len = u32::from_be_bytes([src[0], src[1], src[2], src[3]]) as usize;
             if len > MAX_FRAME {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "frame too large",
+                ));
             }
             if src.len() < 4 + len {
                 src.reserve(4 + len - src.len());
@@ -270,7 +276,7 @@ async fn worker(id: usize, addrs: Vec<SocketAddr>, workload: Workload, state: Ar
                 key: format!("bench-{id}-{op_count}"),
             },
             Workload::Mixed => {
-                if op_count % 2 == 0 {
+                if op_count.is_multiple_of(2) {
                     ClientOperation::Put {
                         key: format!("bench-{id}-{}", op_count / 2),
                         value: (op_count / 2).to_string(),
@@ -311,6 +317,7 @@ async fn worker(id: usize, addrs: Vec<SocketAddr>, workload: Workload, state: Ar
 
 // ── Report ─────────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn print_report(
     addrs: &[SocketAddr],
     concurrency: usize,
@@ -377,8 +384,7 @@ fn print_report(
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
         )
         .init();
 
@@ -387,18 +393,22 @@ async fn main() -> Result<()> {
     let addrs: Vec<SocketAddr> = args
         .cluster
         .split(',')
-        .map(|s| s.trim().parse().with_context(|| format!("invalid addr: {s}")))
+        .map(|s| {
+            s.trim()
+                .parse()
+                .with_context(|| format!("invalid addr: {s}"))
+        })
         .collect::<Result<_>>()?;
 
-    println!(
-        "Connecting to cluster ({} nodes) …",
-        addrs.len()
-    );
+    println!("Connecting to cluster ({} nodes) …", addrs.len());
     // Verify at least one node is reachable.
     TcpStream::connect(addrs[0])
         .await
         .context("cannot reach first cluster node — is the cluster running?")?;
-    println!("OK. Starting {}-client benchmark for {}s …\n", args.concurrency, args.duration);
+    println!(
+        "OK. Starting {}-client benchmark for {}s …\n",
+        args.concurrency, args.duration
+    );
 
     let state = State::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(args.duration);

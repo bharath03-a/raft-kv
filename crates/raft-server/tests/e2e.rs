@@ -19,8 +19,8 @@ use std::{
 };
 
 use futures::{SinkExt, StreamExt};
-use raft_core::message::{ClientOperation, ClientRequest, ClientResult, NodeId, RaftMessage};
 use raft_core::RaftConfig;
+use raft_core::message::{ClientOperation, ClientRequest, ClientResult, NodeId, RaftMessage};
 use raft_server::{codec::RaftCodec, node::NodeActor};
 use tempfile::TempDir;
 use tokio::{net::TcpStream, task::JoinHandle, time};
@@ -60,8 +60,11 @@ impl Cluster {
             .collect();
         let node_ids: Vec<NodeId> = (1..=n as u64).collect();
 
-        let id_addr: HashMap<NodeId, SocketAddr> =
-            node_ids.iter().copied().zip(addrs.iter().copied()).collect();
+        let id_addr: HashMap<NodeId, SocketAddr> = node_ids
+            .iter()
+            .copied()
+            .zip(addrs.iter().copied())
+            .collect();
 
         let mut handles = Vec::with_capacity(n);
 
@@ -89,7 +92,12 @@ impl Cluster {
         // Wait for election (timeout range 150–300 ms → allow 700 ms).
         time::sleep(Duration::from_millis(700)).await;
 
-        Self { addrs, node_ids, handles, _data_dir: data_dir }
+        Self {
+            addrs,
+            node_ids,
+            handles,
+            _data_dir: data_dir,
+        }
     }
 
     /// Abort the node at `index` (simulates a hard crash) and remove it from
@@ -131,16 +139,15 @@ impl Cluster {
 
                 match resp.result {
                     ClientResult::NotLeader { leader_hint } => {
-                        if let Some(hint_id) = leader_hint {
-                            if let Some(idx) =
+                        if let Some(hint_id) = leader_hint
+                            && let Some(idx) =
                                 self.node_ids.iter().position(|&nid| nid == hint_id)
-                            {
-                                addrs = {
-                                    let mut v = self.addrs.clone();
-                                    v.swap(0, idx);
-                                    v
-                                };
-                            }
+                        {
+                            addrs = {
+                                let mut v = self.addrs.clone();
+                                v.swap(0, idx);
+                                v
+                            };
                         }
                         req_id += 1;
                         break;
@@ -156,7 +163,10 @@ impl Cluster {
 
     async fn put(&self, key: &str, value: &str) -> Option<String> {
         match self
-            .send(ClientOperation::Put { key: key.into(), value: value.into() })
+            .send(ClientOperation::Put {
+                key: key.into(),
+                value: value.into(),
+            })
             .await
         {
             ClientResult::Ok(prev) => prev,
@@ -172,10 +182,7 @@ impl Cluster {
     }
 
     async fn delete(&self, key: &str) -> Option<String> {
-        match self
-            .send(ClientOperation::Delete { key: key.into() })
-            .await
-        {
+        match self.send(ClientOperation::Delete { key: key.into() }).await {
             ClientResult::Ok(removed) => removed,
             r => panic!("DELETE unexpected result: {r:?}"),
         }
@@ -213,10 +220,10 @@ async fn find_leader_index(addrs: &[SocketAddr]) -> usize {
                 }))
                 .await;
             let resp = time::timeout(Duration::from_millis(600), framed.next()).await;
-            if let Ok(Some(Ok(RaftMessage::ClientResponse(r)))) = resp {
-                if matches!(r.result, ClientResult::Ok(_)) {
-                    return idx;
-                }
+            if let Ok(Some(Ok(RaftMessage::ClientResponse(r)))) = resp
+                && matches!(r.result, ClientResult::Ok(_))
+            {
+                return idx;
             }
         }
         time::sleep(Duration::from_millis(100)).await;
@@ -230,9 +237,17 @@ async fn find_leader_index(addrs: &[SocketAddr]) -> usize {
 async fn single_node_put_get_delete() {
     let c = Cluster::start(1).await;
 
-    assert_eq!(c.put("x", "hello").await, None, "first PUT: no previous value");
+    assert_eq!(
+        c.put("x", "hello").await,
+        None,
+        "first PUT: no previous value"
+    );
     assert_eq!(c.get("x").await, Some("hello".into()));
-    assert_eq!(c.put("x", "world").await, Some("hello".into()), "overwrite returns prev");
+    assert_eq!(
+        c.put("x", "world").await,
+        Some("hello".into()),
+        "overwrite returns prev"
+    );
     assert_eq!(c.get("x").await, Some("world".into()));
     assert_eq!(c.delete("x").await, Some("world".into()));
     assert_eq!(c.get("x").await, None, "key absent after delete");
@@ -330,5 +345,8 @@ async fn throughput_sequential_puts() {
     println!();
 
     assert_eq!(c.get("bench-0").await, Some("0".into()));
-    assert_eq!(c.get(&format!("bench-{}", N - 1)).await, Some((N - 1).to_string()));
+    assert_eq!(
+        c.get(&format!("bench-{}", N - 1)).await,
+        Some((N - 1).to_string())
+    );
 }

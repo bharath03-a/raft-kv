@@ -1,16 +1,9 @@
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    path::PathBuf,
-    time::Duration,
-};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::Result;
 use raft_core::{
-    message::{
-        ClientOperation, ClientRequest, ClientResponse, ClientResult, NodeId, RaftMessage,
-    },
     RaftConfig, RaftNode,
+    message::{ClientOperation, ClientRequest, ClientResponse, ClientResult, NodeId, RaftMessage},
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -81,7 +74,16 @@ impl NodeActor {
         config: RaftConfig,
         no_sync: bool,
     ) -> Result<Self> {
-        Self::new_with_chaos(id, peers, listen_addr, state_dir, config, no_sync, ChaosConfig::none()).await
+        Self::new_with_chaos(
+            id,
+            peers,
+            listen_addr,
+            state_dir,
+            config,
+            no_sync,
+            ChaosConfig::none(),
+        )
+        .await
     }
 
     /// Create a node actor with a custom chaos configuration.
@@ -102,12 +104,19 @@ impl NodeActor {
 
         // Recover durable state from disk (or start fresh).
         let persistent = storage::load(&state_path).await?;
-        info!(node_id = id, term = persistent.current_term, "recovered state");
+        info!(
+            node_id = id,
+            term = persistent.current_term,
+            "recovered state"
+        );
 
         let peer_ids: Vec<NodeId> = peers.keys().copied().collect();
         // cluster_size must reflect the actual cluster, not the hardcoded default.
         let cluster_size = peer_ids.len() + 1;
-        let config = RaftConfig { cluster_size, ..config };
+        let config = RaftConfig {
+            cluster_size,
+            ..config
+        };
 
         let mut raft = RaftNode::new(id, peer_ids, config.clone());
         raft.persistent = persistent;
@@ -199,7 +208,9 @@ impl NodeActor {
     // ── Inbound message dispatch ───────────────────────────────────────────
 
     async fn handle_incoming(&mut self, incoming: Incoming) -> bool {
-        self.metrics.messages_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.metrics
+            .messages_received
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let raft = self.take_raft();
         let (new_raft, actions) = match incoming.message {
             RaftMessage::VoteRequest(req) => raft.handle_vote_request(req),
@@ -218,11 +229,7 @@ impl NodeActor {
         self.apply_actions(actions).await
     }
 
-    async fn handle_client(
-        &mut self,
-        req: ClientRequest,
-        reply: oneshot::Sender<ClientResponse>,
-    ) {
+    async fn handle_client(&mut self, req: ClientRequest, reply: oneshot::Sender<ClientResponse>) {
         if !self.raft().is_leader() {
             let response = ClientResponse {
                 id: req.id,
@@ -257,7 +264,10 @@ impl NodeActor {
                 let next_index = self.raft().log().last_index() + 1;
                 self.pending_writes.insert(
                     next_index,
-                    PendingWrite { request_id: req.id, reply },
+                    PendingWrite {
+                        request_id: req.id,
+                        reply,
+                    },
                 );
                 let raft = self.take_raft();
                 let (new_raft, actions) = raft.handle_client_request(req);
@@ -290,23 +300,22 @@ impl NodeActor {
     /// timer should be reset.
     async fn apply_actions(&mut self, actions: raft_core::Actions) -> bool {
         // 1. Persist durable state BEFORE sending any messages (Raft §5.4.1).
-        if let Some(ref state) = actions.persist {
-            if let Err(e) = storage::save(&self.state_path, state, !self.no_sync).await {
-                error!("failed to persist state: {e}");
-                // In production we would halt here to avoid violating durability.
-            }
+        if let Some(ref state) = actions.persist
+            && let Err(e) = storage::save(&self.state_path, state, !self.no_sync).await
+        {
+            error!("failed to persist state: {e}");
+            // In production we would halt here to avoid violating durability.
         }
 
         // 2. Send outbound peer messages.
         let msg_count = actions.messages.len() as u64;
         for (to, msg) in actions.messages {
-            let _ = self
-                .transport_tx
-                .send(Outgoing { to, message: msg })
-                .await;
+            let _ = self.transport_tx.send(Outgoing { to, message: msg }).await;
         }
         if msg_count > 0 {
-            self.metrics.messages_sent.fetch_add(msg_count, std::sync::atomic::Ordering::Relaxed);
+            self.metrics
+                .messages_sent
+                .fetch_add(msg_count, std::sync::atomic::Ordering::Relaxed);
         }
 
         // 3. Apply committed entries to the KV state machine.
@@ -341,11 +350,19 @@ impl NodeActor {
             };
             self.metrics.term.store(r.persistent.current_term, Relaxed);
             self.metrics.role.store(role_u8, Relaxed);
-            self.metrics.commit_index.store(r.volatile.commit_index, Relaxed);
-            self.metrics.last_applied.store(r.volatile.last_applied, Relaxed);
+            self.metrics
+                .commit_index
+                .store(r.volatile.commit_index, Relaxed);
+            self.metrics
+                .last_applied
+                .store(r.volatile.last_applied, Relaxed);
             self.metrics.log_length.store(r.log().len() as u64, Relaxed);
-            self.metrics.pending_writes.store(self.pending_writes.len() as u64, Relaxed);
-            self.metrics.pending_reads.store(self.pending_reads.len() as u64, Relaxed);
+            self.metrics
+                .pending_writes
+                .store(self.pending_writes.len() as u64, Relaxed);
+            self.metrics
+                .pending_reads
+                .store(self.pending_reads.len() as u64, Relaxed);
         }
 
         actions.reset_election_timer

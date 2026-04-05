@@ -24,6 +24,8 @@ volumes:
   node1-data:
   node2-data:
   node3-data:
+  node4-data:
+  node5-data:
   prometheus-data:
   grafana-data:
 
@@ -41,7 +43,7 @@ services:
     command:
       - --id=1
       - --addr=0.0.0.0:7001
-      - --peers=2=node2:7001,3=node3:7001
+      - --peers=2=node2:7001,3=node3:7001,4=node4:7001,5=node5:7001
       - --data-dir=/data
       - --metrics-addr=0.0.0.0:9001
     ports:
@@ -55,7 +57,7 @@ services:
     command:
       - --id=2
       - --addr=0.0.0.0:7001
-      - --peers=1=node1:7001,3=node3:7001
+      - --peers=1=node1:7001,3=node3:7001,4=node4:7001,5=node5:7001
       - --data-dir=/data
       - --metrics-addr=0.0.0.0:9001
     ports:
@@ -69,7 +71,7 @@ services:
     command:
       - --id=3
       - --addr=0.0.0.0:7001
-      - --peers=1=node1:7001,2=node2:7001
+      - --peers=1=node1:7001,2=node2:7001,4=node4:7001,5=node5:7001
       - --data-dir=/data
       - --metrics-addr=0.0.0.0:9001
     ports:
@@ -77,6 +79,34 @@ services:
       - "9003:9001"
     volumes:
       - node3-data:/data
+
+  node4:
+    <<: *node-base
+    command:
+      - --id=4
+      - --addr=0.0.0.0:7001
+      - --peers=1=node1:7001,2=node2:7001,3=node3:7001,5=node5:7001
+      - --data-dir=/data
+      - --metrics-addr=0.0.0.0:9001
+    ports:
+      - "7004:7001"
+      - "9004:9001"
+    volumes:
+      - node4-data:/data
+
+  node5:
+    <<: *node-base
+    command:
+      - --id=5
+      - --addr=0.0.0.0:7001
+      - --peers=1=node1:7001,2=node2:7001,3=node3:7001,4=node4:7001
+      - --data-dir=/data
+      - --metrics-addr=0.0.0.0:9001
+    ports:
+      - "7005:7001"
+      - "9005:9001"
+    volumes:
+      - node5-data:/data
 
   prometheus:
     image: prom/prometheus:v2.51.0
@@ -94,6 +124,8 @@ services:
       - node1
       - node2
       - node3
+      - node4
+      - node5
 
   grafana:
     image: grafana/grafana:10.4.0

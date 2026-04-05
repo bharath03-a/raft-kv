@@ -6,8 +6,13 @@ pub type NodeId = u64;
 /// A command to be applied to the key-value state machine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
-    Put { key: String, value: String },
-    Delete { key: String },
+    Put {
+        key: String,
+        value: String,
+    },
+    Delete {
+        key: String,
+    },
     /// Committed by a new leader immediately after election to advance
     /// the commit index to the current term (Raft §8).
     Noop,

@@ -148,11 +148,7 @@ impl RaftNode {
     }
 
     /// Handle a VoteResponse from a peer.
-    pub fn handle_vote_response(
-        self,
-        from: NodeId,
-        resp: VoteResponse,
-    ) -> (Self, Actions) {
+    pub fn handle_vote_response(self, from: NodeId, resp: VoteResponse) -> (Self, Actions) {
         // Stale term — step down and ignore.
         if resp.term > self.persistent.current_term {
             return self.step_down(resp.term);
@@ -184,9 +180,9 @@ impl RaftNode {
         // Accumulate: we use a simple heuristic — each unique "from" that
         // sent a granted response contributes one vote. We track this by
         // reusing LeaderState::match_index as a "voted" set.
-        let mut leader_state = self.leader_state.unwrap_or_else(|| {
-            LeaderState::new(&self.peers, self.persistent.log.last_index())
-        });
+        let mut leader_state = self
+            .leader_state
+            .unwrap_or_else(|| LeaderState::new(&self.peers, self.persistent.log.last_index()));
 
         // Use match_index == u64::MAX as a sentinel for "granted".
         leader_state.match_index.insert(from, u64::MAX);
@@ -199,8 +195,7 @@ impl RaftNode {
         if vote_count >= votes_needed {
             // We won the election — become leader.
             let last_log_index = self.persistent.log.last_index();
-            let new_leader_state =
-                LeaderState::new(&self.peers, last_log_index);
+            let new_leader_state = LeaderState::new(&self.peers, last_log_index);
             let (node, actions) = Self {
                 role: Role::Candidate,
                 leader_state: Some(leader_state),
@@ -233,21 +228,27 @@ impl RaftNode {
         // Single-node: no peers will ever respond, so advance commit on every tick.
         if self.peers.is_empty() {
             let (node, commit) = self.try_advance_commit();
-            return (node, Actions {
-                messages,
-                entries_to_apply: commit.entries_to_apply,
-                ..Actions::default()
-            });
+            return (
+                node,
+                Actions {
+                    messages,
+                    entries_to_apply: commit.entries_to_apply,
+                    ..Actions::default()
+                },
+            );
         }
 
-        (self, Actions { messages, ..Actions::default() })
+        (
+            self,
+            Actions {
+                messages,
+                ..Actions::default()
+            },
+        )
     }
 
     /// Handle an incoming AppendEntries RPC (follower/candidate side).
-    pub fn handle_append_entries(
-        self,
-        req: AppendEntriesRequest,
-    ) -> (Self, Actions) {
+    pub fn handle_append_entries(self, req: AppendEntriesRequest) -> (Self, Actions) {
         // §5.1: higher term → step down.
         let (mut node, mut actions) = if req.term > self.persistent.current_term {
             self.step_down(req.term)
@@ -274,8 +275,7 @@ impl RaftNode {
 
         // Log consistency check (§5.3): prev entry must match.
         if !node.log_matches(req.prev_log_index, req.prev_log_term) {
-            let (conflict_index, conflict_term) =
-                node.find_conflict_hint(req.prev_log_index);
+            let (conflict_index, conflict_term) = node.find_conflict_hint(req.prev_log_index);
             let resp = RaftMessage::AppendEntriesResponse(AppendEntriesResponse {
                 term: node.persistent.current_term,
                 success: false,
@@ -290,10 +290,10 @@ impl RaftNode {
         // Append new entries, truncating any conflicting tail (§5.3).
         let mut log = node.persistent.log.clone();
         for entry in &req.entries {
-            if let Some(existing) = log.get(entry.index) {
-                if existing.term != entry.term {
-                    log = log.truncate_from(entry.index);
-                }
+            if let Some(existing) = log.get(entry.index)
+                && existing.term != entry.term
+            {
+                log = log.truncate_from(entry.index);
             }
             if log.get(entry.index).is_none() {
                 log = log.append(entry.clone());
@@ -365,9 +365,7 @@ impl RaftNode {
             leader_state.next_index.insert(from, sent_up_to + 1);
         } else {
             // Fast backtracking using conflict hints (Raft leader §5.3 optimisation).
-            let next = if let (Some(ci), Some(ct)) =
-                (resp.conflict_index, resp.conflict_term)
-            {
+            let next = if let (Some(ci), Some(ct)) = (resp.conflict_index, resp.conflict_term) {
                 // Find the last entry in our log with conflict_term.
                 let our_last_in_term = (1..=self.persistent.log.last_index())
                     .rev()
@@ -480,11 +478,7 @@ impl RaftNode {
         let next_idx = leader_state.next_index[&peer];
         let prev_log_index = next_idx.saturating_sub(1);
         let prev_log_term = self.persistent.log.term_at(prev_log_index);
-        let entries = self
-            .persistent
-            .log
-            .entries_after(prev_log_index)
-            .to_vec();
+        let entries = self.persistent.log.entries_after(prev_log_index).to_vec();
 
         RaftMessage::AppendEntriesRequest(AppendEntriesRequest {
             term: self.persistent.current_term,
@@ -619,15 +613,25 @@ impl RaftNode {
         // Single-node: no peers will ever ack, so commit the entry immediately.
         if self.peers.is_empty() {
             let (node, commit) = self.try_advance_commit();
-            return (node, Actions {
-                messages,
-                persist,
-                entries_to_apply: commit.entries_to_apply,
-                ..Actions::default()
-            });
+            return (
+                node,
+                Actions {
+                    messages,
+                    persist,
+                    entries_to_apply: commit.entries_to_apply,
+                    ..Actions::default()
+                },
+            );
         }
 
-        (self, Actions { messages, persist, ..Actions::default() })
+        (
+            self,
+            Actions {
+                messages,
+                persist,
+                ..Actions::default()
+            },
+        )
     }
 
     /// Step down to follower when a higher term is observed (§5.1).
@@ -711,9 +715,10 @@ mod tests {
         };
         let (n2_after, actions) = n2.handle_vote_request(req);
         assert_eq!(n2_after.persistent.voted_for, Some(1));
-        let granted = actions.messages.iter().any(|(_, m)| {
-            matches!(m, RaftMessage::VoteResponse(r) if r.vote_granted)
-        });
+        let granted = actions
+            .messages
+            .iter()
+            .any(|(_, m)| matches!(m, RaftMessage::VoteResponse(r) if r.vote_granted));
         assert!(granted);
     }
 
@@ -728,22 +733,34 @@ mod tests {
             last_log_term: 0,
         };
         let (_, actions) = node.handle_vote_request(req);
-        let denied = actions.messages.iter().any(|(_, m)| {
-            matches!(m, RaftMessage::VoteResponse(r) if !r.vote_granted)
-        });
+        let denied = actions
+            .messages
+            .iter()
+            .any(|(_, m)| matches!(m, RaftMessage::VoteResponse(r) if !r.vote_granted));
         assert!(denied);
     }
 
     #[test]
     fn vote_denied_for_second_candidate_same_term() {
         let (_, n2, _) = three_node_cluster();
-        let req1 = VoteRequest { term: 1, candidate_id: 1, last_log_index: 0, last_log_term: 0 };
+        let req1 = VoteRequest {
+            term: 1,
+            candidate_id: 1,
+            last_log_index: 0,
+            last_log_term: 0,
+        };
         let (n2, _) = n2.handle_vote_request(req1);
-        let req2 = VoteRequest { term: 1, candidate_id: 3, last_log_index: 0, last_log_term: 0 };
+        let req2 = VoteRequest {
+            term: 1,
+            candidate_id: 3,
+            last_log_index: 0,
+            last_log_term: 0,
+        };
         let (_, actions) = n2.handle_vote_request(req2);
-        let denied = actions.messages.iter().any(|(_, m)| {
-            matches!(m, RaftMessage::VoteResponse(r) if !r.vote_granted)
-        });
+        let denied = actions
+            .messages
+            .iter()
+            .any(|(_, m)| matches!(m, RaftMessage::VoteResponse(r) if !r.vote_granted));
         assert!(denied);
     }
 
@@ -754,11 +771,22 @@ mod tests {
         assert_eq!(candidate.role, Role::Candidate);
 
         let vote_req = VoteRequest {
-            term: 1, candidate_id: 1, last_log_index: 0, last_log_term: 0,
+            term: 1,
+            candidate_id: 1,
+            last_log_index: 0,
+            last_log_term: 0,
         };
         let (_, a2) = n2.handle_vote_request(vote_req.clone());
-        let resp_from_2 = a2.messages.iter()
-            .find_map(|(_, m)| if let RaftMessage::VoteResponse(r) = m { Some(r.clone()) } else { None })
+        let resp_from_2 = a2
+            .messages
+            .iter()
+            .find_map(|(_, m)| {
+                if let RaftMessage::VoteResponse(r) = m {
+                    Some(r.clone())
+                } else {
+                    None
+                }
+            })
             .unwrap();
         assert!(resp_from_2.vote_granted);
 
@@ -766,7 +794,11 @@ mod tests {
         // Receiving the first granted vote tips us over the majority threshold.
         let (leader, actions) = candidate.handle_vote_response(2, resp_from_2);
 
-        assert_eq!(leader.role, Role::Leader, "should become leader on majority");
+        assert_eq!(
+            leader.role,
+            Role::Leader,
+            "should become leader on majority"
+        );
         // Leader must immediately broadcast AppendEntries (with Noop entry).
         assert!(
             !actions.messages.is_empty(),
@@ -788,17 +820,34 @@ mod tests {
             },
         };
         let (_, actions) = node.handle_client_request(req);
-        assert!(actions.client_responses.iter().any(|r| {
-            matches!(&r.result, ClientResult::NotLeader { .. })
-        }));
+        assert!(
+            actions
+                .client_responses
+                .iter()
+                .any(|r| { matches!(&r.result, ClientResult::NotLeader { .. }) })
+        );
     }
 
     #[test]
     fn follower_appends_entries_and_advances_commit() {
         let node = make_node(2, vec![1, 3]);
         let entries = vec![
-            LogEntry { term: 1, index: 1, command: Command::Put { key: "a".into(), value: "1".into() } },
-            LogEntry { term: 1, index: 2, command: Command::Put { key: "b".into(), value: "2".into() } },
+            LogEntry {
+                term: 1,
+                index: 1,
+                command: Command::Put {
+                    key: "a".into(),
+                    value: "1".into(),
+                },
+            },
+            LogEntry {
+                term: 1,
+                index: 2,
+                command: Command::Put {
+                    key: "b".into(),
+                    value: "2".into(),
+                },
+            },
         ];
         let req = AppendEntriesRequest {
             term: 1,
@@ -812,9 +861,10 @@ mod tests {
         assert_eq!(node.volatile.commit_index, 2);
         assert_eq!(node.persistent.log.last_index(), 2);
         assert_eq!(actions.entries_to_apply.len(), 2);
-        let accepted = actions.messages.iter().any(|(_, m)| {
-            matches!(m, RaftMessage::AppendEntriesResponse(r) if r.success)
-        });
+        let accepted = actions
+            .messages
+            .iter()
+            .any(|(_, m)| matches!(m, RaftMessage::AppendEntriesResponse(r) if r.success));
         assert!(accepted);
     }
 
@@ -830,9 +880,10 @@ mod tests {
             leader_commit: 0,
         };
         let (_, actions) = node.handle_append_entries(req);
-        let rejected = actions.messages.iter().any(|(_, m)| {
-            matches!(m, RaftMessage::AppendEntriesResponse(r) if !r.success)
-        });
+        let rejected = actions
+            .messages
+            .iter()
+            .any(|(_, m)| matches!(m, RaftMessage::AppendEntriesResponse(r) if !r.success));
         assert!(rejected);
     }
 

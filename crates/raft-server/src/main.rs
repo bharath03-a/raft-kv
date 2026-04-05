@@ -1,8 +1,12 @@
-use std::{collections::HashMap, net::{SocketAddr, ToSocketAddrs}, path::PathBuf};
+use std::{
+    collections::HashMap,
+    net::{SocketAddr, ToSocketAddrs},
+    path::PathBuf,
+};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use raft_core::{message::NodeId, RaftConfig};
+use raft_core::{RaftConfig, message::NodeId};
 use raft_server::{metrics, node::NodeActor};
 use tracing::info;
 

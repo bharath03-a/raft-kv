@@ -17,8 +17,8 @@ use std::{
 
 use futures::{SinkExt, StreamExt};
 use raft_core::{
-    message::{ClientOperation, ClientRequest, ClientResult, NodeId, RaftMessage},
     RaftConfig,
+    message::{ClientOperation, ClientRequest, ClientResult, NodeId, RaftMessage},
 };
 use raft_server::{chaos::ChaosConfig, codec::RaftCodec, node::NodeActor};
 use tempfile::TempDir;
@@ -57,8 +57,11 @@ impl ChaosCluster {
             .collect();
         let node_ids: Vec<NodeId> = (1..=n as u64).collect();
 
-        let id_addr: HashMap<NodeId, SocketAddr> =
-            node_ids.iter().copied().zip(addrs.iter().copied()).collect();
+        let id_addr: HashMap<NodeId, SocketAddr> = node_ids
+            .iter()
+            .copied()
+            .zip(addrs.iter().copied())
+            .collect();
 
         let mut handles = Vec::with_capacity(n);
 
@@ -93,7 +96,12 @@ impl ChaosCluster {
             handles.push(tokio::spawn(actor.run()));
         }
 
-        Self { addrs, node_ids, handles, _data_dir: data_dir }
+        Self {
+            addrs,
+            node_ids,
+            handles,
+            _data_dir: data_dir,
+        }
     }
 
     /// Send a single client operation, retrying through all nodes until a
@@ -123,24 +131,22 @@ impl ChaosCluster {
                     continue;
                 }
 
-                let resp =
-                    time::timeout(Duration::from_secs(5), framed.next()).await;
+                let resp = time::timeout(Duration::from_secs(5), framed.next()).await;
                 let Ok(Some(Ok(RaftMessage::ClientResponse(resp)))) = resp else {
                     continue;
                 };
 
                 match resp.result {
                     ClientResult::NotLeader { leader_hint } => {
-                        if let Some(hint_id) = leader_hint {
-                            if let Some(idx) =
+                        if let Some(hint_id) = leader_hint
+                            && let Some(idx) =
                                 self.node_ids.iter().position(|&nid| nid == hint_id)
-                            {
-                                addrs = {
-                                    let mut v = self.addrs.clone();
-                                    v.swap(0, idx);
-                                    v
-                                };
-                            }
+                        {
+                            addrs = {
+                                let mut v = self.addrs.clone();
+                                v.swap(0, idx);
+                                v
+                            };
                         }
                         req_id += 1;
                         break;
@@ -156,7 +162,10 @@ impl ChaosCluster {
 
     async fn put(&self, key: &str, value: &str) {
         match self
-            .send(ClientOperation::Put { key: key.into(), value: value.into() })
+            .send(ClientOperation::Put {
+                key: key.into(),
+                value: value.into(),
+            })
             .await
         {
             ClientResult::Ok(_) => {}
@@ -165,10 +174,7 @@ impl ChaosCluster {
     }
 
     async fn get(&self, key: &str) -> Option<String> {
-        match self
-            .send(ClientOperation::Get { key: key.into() })
-            .await
-        {
+        match self.send(ClientOperation::Get { key: key.into() }).await {
             ClientResult::Ok(v) => v,
             other => panic!("get({key}) failed: {other:?}"),
         }

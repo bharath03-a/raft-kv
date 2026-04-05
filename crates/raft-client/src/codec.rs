@@ -18,7 +18,10 @@ impl Encoder<RaftMessage> for RaftCodec {
             bincode::serialize(&msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let len = payload.len();
         if len > MAX_FRAME_BYTES {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "frame too large",
+            ));
         }
         dst.reserve(4 + len);
         dst.put_u32(len as u32);
@@ -37,7 +40,10 @@ impl Decoder for RaftCodec {
         }
         let len = u32::from_be_bytes([src[0], src[1], src[2], src[3]]) as usize;
         if len > MAX_FRAME_BYTES {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "frame too large",
+            ));
         }
         if src.len() < 4 + len {
             src.reserve(4 + len - src.len());
