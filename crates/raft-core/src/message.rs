@@ -103,6 +103,27 @@ pub enum ClientResult {
     Error(String),
 }
 
+/// InstallSnapshot RPC — sent by the leader to a follower that is so far
+/// behind that the required log entries have been compacted away (Raft §7).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallSnapshotRequest {
+    pub term: u64,
+    pub leader_id: NodeId,
+    /// The last log index included in the snapshot.
+    pub last_included_index: u64,
+    /// The term of that entry.
+    pub last_included_term: u64,
+    /// Opaque serialised state-machine snapshot (KV store bytes).
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallSnapshotResponse {
+    pub term: u64,
+    /// The node sending this response (needed for peer identity on new connections).
+    pub peer_id: NodeId,
+}
+
 // ── Wire envelope ──────────────────────────────────────────────────────────
 
 /// Top-level message type multiplexed over a single TCP connection.
@@ -112,6 +133,8 @@ pub enum RaftMessage {
     VoteResponse(VoteResponse),
     AppendEntriesRequest(AppendEntriesRequest),
     AppendEntriesResponse(AppendEntriesResponse),
+    InstallSnapshotRequest(InstallSnapshotRequest),
+    InstallSnapshotResponse(InstallSnapshotResponse),
     ClientRequest(ClientRequest),
     ClientResponse(ClientResponse),
 }

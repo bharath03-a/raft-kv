@@ -19,9 +19,9 @@ impl RaftConfig {
     /// Conservative defaults that work well for a local cluster.
     pub fn default_local() -> Self {
         Self {
-            election_timeout_min_ms: 150,
-            election_timeout_max_ms: 300,
-            heartbeat_interval_ms: 50,
+            election_timeout_min_ms: 500,
+            election_timeout_max_ms: 1000,
+            heartbeat_interval_ms: 100,
             cluster_size: 3,
         }
     }

@@ -3,21 +3,26 @@ use std::{collections::HashMap, net::SocketAddr, path::PathBuf, time::Duration};
 use anyhow::Result;
 use raft_core::{
     RaftConfig, RaftNode,
-    message::{ClientOperation, ClientRequest, ClientResponse, ClientResult, NodeId, RaftMessage},
+    message::{
+        ClientOperation, ClientRequest, ClientResponse, ClientResult, Command, NodeId, RaftMessage,
+    },
 };
 use tokio::{
     sync::{mpsc, oneshot},
     time,
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     chaos::ChaosConfig,
     kv::KvStore,
     metrics::Metrics,
-    storage,
+    storage::{self, SnapshotFile},
     transport::{Incoming, Outgoing, Transport},
 };
+
+/// Compact the log when it exceeds this many entries. §7.
+const SNAPSHOT_THRESHOLD: usize = 100;
 
 /// A pending write request from a client waiting for log commitment.
 struct PendingWrite {
@@ -52,6 +57,7 @@ pub struct NodeActor {
     /// Pending reads buffered for the read-index protocol.
     pending_reads: Vec<PendingRead>,
     state_path: PathBuf,
+    snapshot_path: PathBuf,
     config: RaftConfig,
     /// When true, skip fsync on persist (faster but not crash-safe).
     no_sync: bool,
@@ -60,11 +66,6 @@ pub struct NodeActor {
 }
 
 impl NodeActor {
-    /// Create and initialise a node actor.
-    ///
-    /// The channel pair for client requests is created internally: the sender
-    /// end is wired to the transport (which accepts client TCP connections on
-    /// the same port as peer traffic) and the receiver end is kept here.
     /// Create and initialise a node actor with no chaos injection.
     pub async fn new(
         id: NodeId,
@@ -101,17 +102,34 @@ impl NodeActor {
         chaos: ChaosConfig,
     ) -> Result<Self> {
         let state_path = state_dir.join(format!("node-{id}.state"));
+        let snapshot_path = state_dir.join(format!("node-{id}.snapshot"));
 
-        // Recover durable state from disk (or start fresh).
-        let persistent = storage::load(&state_path).await?;
+        // Load snapshot first (if any), then restore the KV store from it.
+        let (kv, snapshot_base) = match storage::load_snapshot(&snapshot_path).await? {
+            Some(snap) => {
+                info!(
+                    node_id = id,
+                    last_included_index = snap.last_included_index,
+                    "restoring KV store from snapshot"
+                );
+                let kv = kv_from_pairs(snap.kv_data);
+                let base = (snap.last_included_index, snap.last_included_term);
+                (kv, Some(base))
+            }
+            None => (KvStore::new(), None),
+        };
+
+        // Load Raft persistent state (log, term, vote).
+        // Pass the snapshot base so the log is positioned correctly after compaction.
+        let persistent = storage::load(&state_path, snapshot_base).await?;
         info!(
             node_id = id,
             term = persistent.current_term,
-            "recovered state"
+            log_len = persistent.log.len(),
+            "recovered raft state"
         );
 
         let peer_ids: Vec<NodeId> = peers.keys().copied().collect();
-        // cluster_size must reflect the actual cluster, not the hardcoded default.
         let cluster_size = peer_ids.len() + 1;
         let config = RaftConfig {
             cluster_size,
@@ -121,22 +139,26 @@ impl NodeActor {
         let mut raft = RaftNode::new(id, peer_ids, config.clone());
         raft.persistent = persistent;
 
-        // Wire the client channel: transport writes to `client_tx`,
-        // this actor reads from `client_rx`.
-        let (client_tx, client_rx) = mpsc::channel(256);
+        // Initialise volatile indices from the snapshot so the node does not
+        // re-apply already-snapshotted entries on startup.
+        let snap_idx = raft.persistent.log.snapshot_last_index();
+        raft.volatile.commit_index = snap_idx;
+        raft.volatile.last_applied = snap_idx;
 
+        let (client_tx, client_rx) = mpsc::channel(256);
         let transport = Transport::start(id, listen_addr, peers, client_tx, chaos);
 
         Ok(Self {
             id,
             raft: Some(raft),
-            kv: KvStore::new(),
+            kv,
             transport_tx: transport.outgoing_tx,
             transport_rx: transport.incoming_rx,
             client_rx,
             pending_writes: HashMap::new(),
             pending_reads: Vec::new(),
             state_path,
+            snapshot_path,
             config,
             no_sync,
             metrics: Metrics::new(),
@@ -144,9 +166,6 @@ impl NodeActor {
     }
 
     /// Return a shared reference to the node's live metrics.
-    ///
-    /// Callers can pass this `Arc` to `metrics::serve` to expose the metrics
-    /// over HTTP without any additional synchronisation.
     pub fn metrics(&self) -> std::sync::Arc<Metrics> {
         std::sync::Arc::clone(&self.metrics)
     }
@@ -159,22 +178,18 @@ impl NodeActor {
 
         loop {
             let reset_election_timer = tokio::select! {
-                // Inbound peer message.
                 Some(incoming) = self.transport_rx.recv() => {
                     self.handle_incoming(incoming).await
                 }
-                // Client request submitted via the TCP client handler.
                 Some((req, reply)) = self.client_rx.recv() => {
                     self.handle_client(req, reply).await;
                     false
                 }
-                // Election timeout fired.
                 _ = election_timer.tick() => {
                     debug!(node_id = self.id, "election timeout");
                     self.handle_election_timeout().await;
-                    true // always reset after timeout fires
+                    true
                 }
-                // Heartbeat tick (leader only — ignored by followers/candidates).
                 _ = heartbeat_timer.tick() => {
                     self.handle_heartbeat().await;
                     false
@@ -219,6 +234,10 @@ impl NodeActor {
             RaftMessage::AppendEntriesResponse(resp) => {
                 raft.handle_append_entries_response(incoming.from, resp)
             }
+            RaftMessage::InstallSnapshotRequest(req) => raft.handle_install_snapshot(req),
+            RaftMessage::InstallSnapshotResponse(resp) => {
+                raft.handle_install_snapshot_response(incoming.from, resp)
+            }
             RaftMessage::ClientRequest(req) => raft.handle_client_request(req),
             RaftMessage::ClientResponse(_) => {
                 self.raft = Some(raft);
@@ -243,9 +262,6 @@ impl NodeActor {
 
         match &req.operation {
             ClientOperation::Get { key } => {
-                // Read-index protocol: record read_index = current commit_index,
-                // trigger a heartbeat to confirm we are still the leader, then
-                // serve the read once last_applied >= read_index.
                 let read_index = self.raft().volatile.commit_index;
                 self.pending_reads.push(PendingRead {
                     key: key.clone(),
@@ -259,8 +275,6 @@ impl NodeActor {
                 self.apply_actions(actions).await;
             }
             ClientOperation::Put { .. } | ClientOperation::Delete { .. } => {
-                // Record the pending write before entering the core so we can
-                // associate the log index with the reply channel.
                 let next_index = self.raft().log().last_index() + 1;
                 self.pending_writes.insert(
                     next_index,
@@ -296,15 +310,12 @@ impl NodeActor {
 
     // ── Action executor ────────────────────────────────────────────────────
 
-    /// Execute all side-effects in `actions` and return whether the election
-    /// timer should be reset.
     async fn apply_actions(&mut self, actions: raft_core::Actions) -> bool {
         // 1. Persist durable state BEFORE sending any messages (Raft §5.4.1).
         if let Some(ref state) = actions.persist
             && let Err(e) = storage::save(&self.state_path, state, !self.no_sync).await
         {
             error!("failed to persist state: {e}");
-            // In production we would halt here to avoid violating durability.
         }
 
         // 2. Send outbound peer messages.
@@ -318,15 +329,28 @@ impl NodeActor {
                 .fetch_add(msg_count, std::sync::atomic::Ordering::Relaxed);
         }
 
-        // 3. Apply committed entries to the KV state machine.
+        // 3. Apply a snapshot received from the leader (before applying log entries
+        //    so that the two don't overlap).
+        if let Some(snap_req) = actions.install_snapshot
+            && let Err(e) = self.apply_snapshot(snap_req).await
+        {
+            error!("failed to apply snapshot: {e}");
+        }
+
+        // 4. Send snapshots to lagging followers.
+        for peer in actions.send_snapshot_to {
+            if let Err(e) = self.send_snapshot_to_peer(peer).await {
+                warn!("failed to send snapshot to peer {peer}: {e}");
+            }
+        }
+
+        // 5. Apply committed entries to the KV state machine.
         for entry in &actions.entries_to_apply {
             let (new_kv, result) = self.kv.apply(&entry.command);
             self.kv = new_kv;
             if let Some(raft) = self.raft.as_mut() {
                 raft.volatile.last_applied = entry.index;
             }
-
-            // Resolve pending write for this log index (using actual KV result).
             if let Some(pending) = self.pending_writes.remove(&entry.index) {
                 let response = ClientResponse {
                     id: pending.request_id,
@@ -336,10 +360,21 @@ impl NodeActor {
             }
         }
 
-        // 4. Serve pending reads if last_applied has caught up to read_index.
+        // 6. Serve pending reads if last_applied has caught up to read_index.
         self.drain_pending_reads();
 
-        // 5. Update live metrics after every state transition.
+        // 7. Trigger a snapshot if the log has grown past the threshold.
+        let log_len = self.raft().log().len();
+        let last_applied = self.raft().volatile.last_applied;
+        let snap_base = self.raft().persistent.log.snapshot_last_index();
+        if log_len > SNAPSHOT_THRESHOLD
+            && last_applied > snap_base
+            && let Err(e) = self.take_snapshot(last_applied).await
+        {
+            error!("snapshot failed: {e}");
+        }
+
+        // 8. Update live metrics.
         {
             use std::sync::atomic::Ordering::Relaxed;
             let r = self.raft();
@@ -387,6 +422,112 @@ impl NodeActor {
             let _ = pr.reply.send(response);
         }
     }
+
+    // ── Snapshotting (Raft §7) ─────────────────────────────────────────────
+
+    /// Take a local snapshot of the KV store up to `last_applied`, write it
+    /// to disk, then compact the in-memory log.
+    async fn take_snapshot(&mut self, up_to_index: u64) -> Result<()> {
+        let snap_term = self.raft().persistent.log.term_at(up_to_index);
+
+        // Serialise the current KV store.
+        let kv_data = self.kv.clone().into_pairs();
+        let snapshot = SnapshotFile {
+            last_included_index: up_to_index,
+            last_included_term: snap_term,
+            kv_data,
+        };
+
+        // Persist snapshot before compacting the log.
+        storage::save_snapshot(&self.snapshot_path, &snapshot, !self.no_sync).await?;
+
+        // Compact the in-memory log and persist the new (shorter) state.
+        let raft = self.take_raft();
+        let new_raft = raft.compact_log(up_to_index);
+        storage::save(&self.state_path, &new_raft.persistent, !self.no_sync).await?;
+        self.raft = Some(new_raft);
+
+        info!(
+            node_id = self.id,
+            up_to_index, "snapshot taken — log compacted"
+        );
+        Ok(())
+    }
+
+    /// Send the latest snapshot to a follower that has fallen behind the
+    /// leader's compaction point (Raft §7).
+    async fn send_snapshot_to_peer(&self, peer: NodeId) -> Result<()> {
+        let snap = storage::load_snapshot(&self.snapshot_path)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no local snapshot to send to peer {peer}"))?;
+
+        let data = bincode::serialize(&snap)?;
+
+        let req = RaftMessage::InstallSnapshotRequest(raft_core::message::InstallSnapshotRequest {
+            term: self.raft().current_term(),
+            leader_id: self.id,
+            last_included_index: snap.last_included_index,
+            last_included_term: snap.last_included_term,
+            data,
+        });
+
+        let _ = self
+            .transport_tx
+            .send(Outgoing {
+                to: peer,
+                message: req,
+            })
+            .await;
+
+        info!(
+            node_id = self.id,
+            peer,
+            last_included_index = snap.last_included_index,
+            "sent InstallSnapshot to peer"
+        );
+        Ok(())
+    }
+
+    /// Apply an `InstallSnapshot` received from the leader.
+    ///
+    /// Deserialises the KV data, rebuilds the in-memory store, persists the
+    /// snapshot to disk, and updates `last_applied`.
+    async fn apply_snapshot(
+        &mut self,
+        req: raft_core::message::InstallSnapshotRequest,
+    ) -> Result<()> {
+        let snap: SnapshotFile = bincode::deserialize(&req.data)?;
+
+        // Rebuild the KV store from snapshot data.
+        self.kv = kv_from_pairs(snap.kv_data.clone());
+
+        // Persist the snapshot so we can restore on restart.
+        storage::save_snapshot(&self.snapshot_path, &snap, !self.no_sync).await?;
+
+        // Advance last_applied (commit_index was already updated in the core).
+        if let Some(raft) = self.raft.as_mut() {
+            raft.volatile.last_applied = req.last_included_index;
+        }
+
+        // Drain any reads that are now satisfiable.
+        self.drain_pending_reads();
+
+        info!(
+            node_id = self.id,
+            last_included_index = req.last_included_index,
+            "installed snapshot from leader"
+        );
+        Ok(())
+    }
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+fn kv_from_pairs(pairs: Vec<(String, String)>) -> KvStore {
+    pairs.into_iter().fold(KvStore::new(), |kv, (k, v)| {
+        let (new_kv, _) = kv.apply(&Command::Put { key: k, value: v });
+        new_kv
+    })
 }
 
 // ── In-process client handle (used for testing) ────────────────────────────

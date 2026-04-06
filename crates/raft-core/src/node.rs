@@ -3,7 +3,8 @@ use crate::{
     log::RaftLog,
     message::{
         AppendEntriesRequest, AppendEntriesResponse, ClientRequest, ClientResponse, ClientResult,
-        Command, LogEntry, NodeId, RaftMessage, VoteRequest, VoteResponse,
+        Command, InstallSnapshotRequest, InstallSnapshotResponse, LogEntry, NodeId, RaftMessage,
+        VoteRequest, VoteResponse,
     },
     state::{Actions, LeaderState, PersistentState, Role, VolatileState},
 };
@@ -223,7 +224,7 @@ impl RaftNode {
             return (self, Actions::default());
         }
 
-        let messages = self.build_append_entries_for_all_peers();
+        let (messages, send_snapshot_to) = self.build_messages_for_all_peers();
 
         // Single-node: no peers will ever respond, so advance commit on every tick.
         if self.peers.is_empty() {
@@ -233,6 +234,7 @@ impl RaftNode {
                 Actions {
                     messages,
                     entries_to_apply: commit.entries_to_apply,
+                    send_snapshot_to,
                     ..Actions::default()
                 },
             );
@@ -242,6 +244,7 @@ impl RaftNode {
             self,
             Actions {
                 messages,
+                send_snapshot_to,
                 ..Actions::default()
             },
         )
@@ -456,6 +459,11 @@ impl RaftNode {
         if prev_index == 0 {
             return true; // beginning of log always matches
         }
+        let snap_idx = self.persistent.log.snapshot_last_index();
+        if prev_index < snap_idx {
+            // Already committed and applied — trivially consistent.
+            return true;
+        }
         self.persistent.log.term_at(prev_index) == prev_term
     }
 
@@ -466,10 +474,12 @@ impl RaftNode {
             // prev_index beyond our log end.
             return (self.persistent.log.last_index() + 1, None);
         }
-        let conflict_index = (1..=prev_index)
+        let snap_idx = self.persistent.log.snapshot_last_index();
+        let search_start = snap_idx + 1; // don't walk into compacted region
+        let conflict_index = (search_start..=prev_index)
             .rev()
             .find(|&i| self.persistent.log.term_at(i) != conflict_term)
-            .map_or(1, |i| i + 1);
+            .map_or(search_start, |i| i + 1);
         (conflict_index, Some(conflict_term))
     }
 
@@ -490,11 +500,32 @@ impl RaftNode {
         })
     }
 
+    /// Build messages for all peers, separating out those that need a snapshot.
+    ///
+    /// Returns `(messages, peers_needing_snapshot)`. A peer needs a snapshot
+    /// when its `next_index` has fallen inside the compacted region.
+    fn build_messages_for_all_peers(&self) -> (Vec<(NodeId, RaftMessage)>, Vec<NodeId>) {
+        let snap_idx = self.persistent.log.snapshot_last_index();
+        let mut messages = Vec::new();
+        let mut need_snapshot = Vec::new();
+
+        for &peer in &self.peers {
+            let next_idx = self
+                .leader_state
+                .as_ref()
+                .map_or(1, |ls| ls.next_index[&peer]);
+            if next_idx <= snap_idx {
+                need_snapshot.push(peer);
+            } else {
+                messages.push((peer, self.build_append_entries_for_peer(peer)));
+            }
+        }
+        (messages, need_snapshot)
+    }
+
     fn build_append_entries_for_all_peers(&self) -> Vec<(NodeId, RaftMessage)> {
-        self.peers
-            .iter()
-            .map(|&peer| (peer, self.build_append_entries_for_peer(peer)))
-            .collect()
+        let (messages, _) = self.build_messages_for_all_peers();
+        messages
     }
 
     fn become_leader(mut self, leader_state: LeaderState) -> (Self, Actions) {
@@ -606,7 +637,7 @@ impl RaftNode {
         // Note: we do NOT immediately respond to the client. The response
         // is sent by the server layer once the entry commits (tracked via
         // leader_state.pending keyed by log index).
-        let messages = self.build_append_entries_for_all_peers();
+        let (messages, send_snapshot_to) = self.build_messages_for_all_peers();
         let persist = Some(persistent);
         let _ = req_id; // server layer owns the channel mapping
 
@@ -619,6 +650,7 @@ impl RaftNode {
                     messages,
                     persist,
                     entries_to_apply: commit.entries_to_apply,
+                    send_snapshot_to,
                     ..Actions::default()
                 },
             );
@@ -629,9 +661,108 @@ impl RaftNode {
             Actions {
                 messages,
                 persist,
+                send_snapshot_to,
                 ..Actions::default()
             },
         )
+    }
+
+    /// Handle an incoming InstallSnapshot RPC (follower side, Raft §7).
+    ///
+    /// The server layer must apply the snapshot to the state machine when
+    /// `actions.install_snapshot` is `Some`.
+    pub fn handle_install_snapshot(self, req: InstallSnapshotRequest) -> (Self, Actions) {
+        // §5.1: higher term → step down first.
+        let (mut node, mut actions) = if req.term > self.persistent.current_term {
+            self.step_down(req.term)
+        } else {
+            (self, Actions::default())
+        };
+
+        // Reject stale leader.
+        if req.term < node.persistent.current_term {
+            let resp = RaftMessage::InstallSnapshotResponse(InstallSnapshotResponse {
+                term: node.persistent.current_term,
+                peer_id: node.id,
+            });
+            actions.messages.push((req.leader_id, resp));
+            return (node, actions);
+        }
+
+        // Valid message from current leader — reset election timer.
+        actions.reset_election_timer = true;
+        node.current_leader = Some(req.leader_id);
+
+        // If we already have everything up to this snapshot, acknowledge and skip.
+        if req.last_included_index <= node.volatile.commit_index {
+            let resp = RaftMessage::InstallSnapshotResponse(InstallSnapshotResponse {
+                term: node.persistent.current_term,
+                peer_id: node.id,
+            });
+            actions.messages.push((req.leader_id, resp));
+            return (node, actions);
+        }
+
+        // Compact the log: keep entries that extend beyond the snapshot, discard the rest.
+        let new_log = if node.persistent.log.last_index() > req.last_included_index {
+            node.persistent.log.compact_up_to(req.last_included_index)
+        } else {
+            RaftLog::new_with_snapshot(req.last_included_index, req.last_included_term)
+        };
+
+        let persistent = PersistentState {
+            current_term: node.persistent.current_term,
+            voted_for: node.persistent.voted_for,
+            log: new_log,
+        };
+
+        node.volatile.commit_index = req.last_included_index;
+        // last_applied is advanced by the server layer after the snapshot is applied.
+        node.persistent = persistent.clone();
+
+        actions.persist = Some(persistent);
+        actions.install_snapshot = Some(req.clone());
+
+        let resp = RaftMessage::InstallSnapshotResponse(InstallSnapshotResponse {
+            term: node.persistent.current_term,
+            peer_id: node.id,
+        });
+        actions.messages.push((req.leader_id, resp));
+
+        (node, actions)
+    }
+
+    /// Handle an InstallSnapshot response (leader side, Raft §7).
+    pub fn handle_install_snapshot_response(
+        mut self,
+        from: NodeId,
+        resp: InstallSnapshotResponse,
+    ) -> (Self, Actions) {
+        if resp.term > self.persistent.current_term {
+            return self.step_down(resp.term);
+        }
+        if self.role != Role::Leader {
+            return (self, Actions::default());
+        }
+        // The follower has installed our snapshot — advance its tracked indices.
+        if let Some(ls) = self.leader_state.as_mut() {
+            let snap_idx = self.persistent.log.snapshot_last_index();
+            let match_entry = ls.match_index.entry(from).or_insert(0);
+            if snap_idx > *match_entry {
+                *match_entry = snap_idx;
+            }
+            ls.next_index.insert(from, snap_idx + 1);
+        }
+        (self, Actions::default())
+    }
+
+    /// Compact the log up to and including `index`.
+    ///
+    /// Called by the server layer **after** a snapshot has been safely
+    /// written to disk. Returns a new `RaftNode` with the compacted log.
+    pub fn compact_log(mut self, index: u64) -> Self {
+        self.persistent.log = self.persistent.log.compact_up_to(index);
+        self
     }
 
     /// Step down to follower when a higher term is observed (§5.1).

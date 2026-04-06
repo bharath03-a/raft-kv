@@ -8,6 +8,8 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
 };
 
+// ── Raft persistent state ──────────────────────────────────────────────────
+
 /// Serialisable snapshot of `PersistentState`.
 ///
 /// We keep this separate from the core type so the storage format can
@@ -33,35 +35,16 @@ pub async fn save(path: &Path, state: &PersistentState, sync: bool) -> Result<()
 
     let payload = bincode::serialize(&stored).context("failed to serialise persistent state")?;
 
-    let tmp_path = path.with_extension("tmp");
-
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp_path)
-        .await
-        .with_context(|| format!("open {}", tmp_path.display()))?;
-
-    file.write_all(&payload)
-        .await
-        .context("write persistent state")?;
-
-    file.flush().await.context("flush")?;
-    if sync {
-        file.sync_all().await.context("fsync")?;
-    }
-
-    fs::rename(&tmp_path, path)
-        .await
-        .context("rename tmp → state file")?;
-
-    Ok(())
+    atomic_write(path, &payload, sync).await
 }
 
 /// Load `PersistentState` from `path`, or return a default if the file
 /// does not exist (first boot).
-pub async fn load(path: &Path) -> Result<PersistentState> {
+///
+/// `snapshot_base` sets the log's compaction baseline so that log entries
+/// loaded from disk (which may start above index 1 after compaction) are
+/// appended to the correct base.
+pub async fn load(path: &Path, snapshot_base: Option<(u64, u64)>) -> Result<PersistentState> {
     if !path.exists() {
         return Ok(PersistentState::new());
     }
@@ -77,7 +60,8 @@ pub async fn load(path: &Path) -> Result<PersistentState> {
 
     let stored: StoredState = bincode::deserialize(&buf).context("deserialise persistent state")?;
 
-    let mut log = raft_core::log::RaftLog::new();
+    let (snap_idx, snap_term) = snapshot_base.unwrap_or((0, 0));
+    let mut log = raft_core::log::RaftLog::new_with_snapshot(snap_idx, snap_term);
     for entry in stored.log_entries {
         log = log.append(entry);
     }
@@ -87,4 +71,73 @@ pub async fn load(path: &Path) -> Result<PersistentState> {
         voted_for: stored.voted_for,
         log,
     })
+}
+
+// ── Snapshot file ──────────────────────────────────────────────────────────
+
+/// On-disk representation of a KV state machine snapshot (Raft §7).
+///
+/// Stored separately from the Raft state file so that snapshot data
+/// (potentially large) does not slow down the hot-path fsync for log entries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotFile {
+    /// Last log index covered by this snapshot.
+    pub last_included_index: u64,
+    /// Term of that entry (needed for log consistency after restart).
+    pub last_included_term: u64,
+    /// Key-value pairs at the time of the snapshot.
+    pub kv_data: Vec<(String, String)>,
+}
+
+/// Write a snapshot to `path` atomically.
+pub async fn save_snapshot(path: &Path, snapshot: &SnapshotFile, sync: bool) -> Result<()> {
+    let payload = bincode::serialize(snapshot).context("failed to serialise snapshot")?;
+    atomic_write(path, &payload, sync).await
+}
+
+/// Load a snapshot from `path`. Returns `None` if the file does not exist
+/// (no snapshot has been taken yet).
+pub async fn load_snapshot(path: &Path) -> Result<Option<SnapshotFile>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let mut file = fs::File::open(path)
+        .await
+        .with_context(|| format!("open snapshot {}", path.display()))?;
+
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).await.context("read snapshot")?;
+
+    let snapshot: SnapshotFile = bincode::deserialize(&buf).context("deserialise snapshot")?;
+
+    Ok(Some(snapshot))
+}
+
+// ── Shared helper ──────────────────────────────────────────────────────────
+
+/// Write `payload` to `path` atomically: write to a `.tmp` file, optionally
+/// fsync, then rename into place.
+async fn atomic_write(path: &Path, payload: &[u8], sync: bool) -> Result<()> {
+    let tmp_path = path.with_extension("tmp");
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp_path)
+        .await
+        .with_context(|| format!("open {}", tmp_path.display()))?;
+
+    file.write_all(payload).await.context("write")?;
+    file.flush().await.context("flush")?;
+    if sync {
+        file.sync_all().await.context("fsync")?;
+    }
+
+    fs::rename(&tmp_path, path)
+        .await
+        .context("rename tmp → target")?;
+
+    Ok(())
 }

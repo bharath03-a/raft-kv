@@ -50,6 +50,12 @@ impl KvStore {
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
+
+    /// Consume the store and return all key-value pairs.
+    /// Used when serialising a snapshot for `InstallSnapshot` (Raft §7).
+    pub fn into_pairs(self) -> Vec<(String, String)> {
+        self.data.into_iter().collect()
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

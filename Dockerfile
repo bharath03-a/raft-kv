@@ -2,7 +2,7 @@
 # Compile the workspace in release mode. Cargo's build cache is not preserved
 # between Docker builds by default; add --mount=type=cache,target=/build/target
 # if you are using BuildKit and want layer caching.
-FROM rust:1.86-bookworm AS builder
+FROM rust:1.88-bookworm AS builder
 
 WORKDIR /build
 

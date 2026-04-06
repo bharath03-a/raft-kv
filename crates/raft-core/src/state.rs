@@ -117,4 +117,13 @@ pub struct Actions {
     pub client_responses: Vec<ClientResponse>,
     /// Whether the election timer should be reset.
     pub reset_election_timer: bool,
+    /// Peers to which the leader must send an InstallSnapshot RPC.
+    ///
+    /// These peers have fallen so far behind that the required log entries
+    /// have been compacted away. The server layer is responsible for
+    /// serialising the current KV snapshot and sending the RPC.
+    pub send_snapshot_to: Vec<NodeId>,
+    /// An InstallSnapshot received from the leader that the server must
+    /// apply to the state machine and persist to disk.
+    pub install_snapshot: Option<crate::message::InstallSnapshotRequest>,
 }
